@@ -19,7 +19,7 @@ sha3 = "0.10"
 
 [[bin]]
 name = "quanjp-prime-hunter"
-path = "main.rs"
+path = "src/main.rs"
 
 [profile.release]
 opt-level = 3
