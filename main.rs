@@ -323,6 +323,8 @@ impl Statistics {
 // | Target Digits | Sequence Length              |
 // |---------------|------------------------------|
 // | ~2,466        | Config::new(4096)            |
+// | ~4,096        | Config::new(6804)            |
+// | ~4,932        | Config::new(8192)            |
 // | ~8,000        | Config::new(13300)           |
 // | ~10,000       | Config::new(16600)           |
 // | ~50,000       | Config::new(83000)           |
@@ -346,7 +348,7 @@ fn main() {
     // =========================================================================
     // 🎯 CHANGE THIS LINE TO TARGET DIFFERENT DIGIT SIZES
     // =========================================================================
-    let config = Config::new(8192);  // Target: ~4,932 digits
+    let config = Config::new(6804);  // Target: ~4,096 digits
     // =========================================================================
     
     rayon::ThreadPoolBuilder::new()
