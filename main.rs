@@ -346,7 +346,7 @@ fn main() {
     // =========================================================================
     // 🎯 CHANGE THIS LINE TO TARGET DIFFERENT DIGIT SIZES
     // =========================================================================
-    let config = Config::new(4096);  // Target: ~2,466 digits
+    let config = Config::new(8192);  // Target: ~4,932 digits
     // =========================================================================
     
     rayon::ThreadPoolBuilder::new()
