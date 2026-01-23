@@ -265,7 +265,7 @@ impl Config {
         Self {
             sequence_len,
             entropy_threshold: 1.88,
-            primality_rounds: 25,
+            primality_rounds: 15,
             max_attempts: 100_000,
             pattern_guide_ratio: 0.75,
             num_threads,
