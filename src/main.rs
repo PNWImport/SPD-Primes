@@ -500,7 +500,7 @@ fn main() {
     // =========================================================================
     // 🎯 CHANGE THIS LINE TO TARGET DIFFERENT DIGIT SIZES
     // =========================================================================
-    let config = Config::new(13609);  // Target: ~8,192 digits
+    let config = Config::new(6644);  // Target: ~4,000 digits
     // =========================================================================
 
     let db = init_database().expect("Failed to initialize database");
