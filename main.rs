@@ -164,7 +164,7 @@ fn enhanced_fermat_test(n: &BigUint) -> bool {
     
     let n_minus_1 = n - BigUint::one();
     
-    for base in [2u32, 3u32, 5u32] {
+    for base in [2u32, 3u32] {
         let base_big = BigUint::from(base);
         if base_big.modpow(&n_minus_1, n) != BigUint::one() {
             return false;
@@ -373,7 +373,7 @@ fn main() {
     
     println!("\n{}", "🔧 Optimizations:".bright_cyan().bold());
     println!("   ✅ Power cache ({} entries)", POWER_CACHE.len());
-    println!("   ✅ Multi-base Fermat (2,3,5)");
+    println!("   ✅ Multi-base Fermat (2,3)");
     println!("   ✅ Array patterns (O(1))");
     println!("   ✅ Quick composite (2,3,5,7,11,13)");
     
