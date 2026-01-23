@@ -1,6 +1,7 @@
 use rusqlite::{Connection, params};
 use std::fs;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() {
     let db = Connection::open("prime_history.db").expect("Failed to open database");
@@ -27,6 +28,7 @@ fn main() {
         return;
     }
 
+    let mut count = 0;
     for entry in fs::read_dir(results_dir).expect("Failed to read results directory") {
         let entry = match entry {
             Ok(e) => e,
@@ -49,14 +51,19 @@ fn main() {
                      VALUES (?, ?, ?, ?, ?, ?, ?)",
                     params![timestamp, digits, entropy, seq_len, symbols, session_hash, result_hash],
                 ) {
-                    Ok(_) => println!("  ✓ Saved {}-digit prime", digits),
+                    Ok(_) => {
+                        println!("  ✓ Saved {}-digit prime", digits);
+                        count += 1;
+                    }
                     Err(e) => println!("  ✗ Error: {}", e),
                 }
+            } else {
+                println!("  ✗ Could not parse file");
             }
         }
     }
 
-    println!("\n✅ Ingestion complete!");
+    println!("\n✅ Ingestion complete! Processed {} discoveries", count);
 
     // Show what was ingested
     let mut stmt = db.prepare("SELECT COUNT(*), GROUP_CONCAT(DISTINCT digits) FROM discoveries").unwrap();
@@ -64,8 +71,9 @@ fn main() {
         Ok((row.get::<_, i32>(0)?, row.get::<_, String>(1)?))
     });
 
-    if let Ok((count, digits)) = result {
-        println!("Database now contains {} prime discoveries: {}", count, digits);
+    if let Ok((total, digits_str)) = result {
+        println!("Database now contains {} total discoveries:", total);
+        println!("  Digit sizes: {}", digits_str);
     }
 }
 
@@ -80,8 +88,6 @@ fn parse_result_file(content: &str) -> Option<(i32, f64, i32, i64, String, Strin
     let mut result_hash = String::new();
     let mut symbols = String::new();
 
-    let mut in_symbols = false;
-
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
 
@@ -92,13 +98,15 @@ fn parse_result_file(content: &str) -> Option<(i32, f64, i32, i64, String, Strin
         } else if trimmed.starts_with("Sequence Length:") {
             seq_len = trimmed.split(':').nth(1)?.trim().parse().ok()?;
         } else if trimmed.starts_with("Timestamp:") {
-            timestamp = trimmed.split(':').nth(1)?.trim().parse().ok()?;
+            // New format: extract timestamp if present
+            if let Ok(ts) = trimmed.split(':').nth(1)?.trim().parse::<i64>() {
+                timestamp = ts;
+            }
         } else if trimmed.starts_with("Session Hash:") {
             session_hash = trimmed.split(':').nth(1)?.trim().to_string();
         } else if trimmed.starts_with("Result Hash:") {
             result_hash = trimmed.split(':').nth(1)?.trim().to_string();
         } else if trimmed == "Symbols:" {
-            in_symbols = true;
             // Next line should be the array
             if i + 1 < lines.len() {
                 symbols = lines[i + 1].to_string();
@@ -107,9 +115,26 @@ fn parse_result_file(content: &str) -> Option<(i32, f64, i32, i64, String, Strin
         }
     }
 
-    if digits > 0 && entropy > 0.0 && seq_len > 0 && !symbols.is_empty() && !session_hash.is_empty() {
-        Some((digits, entropy, seq_len, timestamp, session_hash, result_hash, symbols))
-    } else {
-        None
+    // Validate required fields
+    if digits <= 0 || entropy <= 0.0 || seq_len <= 0 || symbols.is_empty() {
+        return None;
     }
+
+    // If timestamp is missing (old format), use current time
+    if timestamp == 0 {
+        timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+    }
+
+    // If hashes are missing, generate placeholder ones
+    if session_hash.is_empty() {
+        session_hash = format!("legacy-{}-digits", digits);
+    }
+    if result_hash.is_empty() {
+        result_hash = format!("legacy-hash-{}", digits);
+    }
+
+    Some((digits, entropy, seq_len, timestamp, session_hash, result_hash, symbols))
 }
