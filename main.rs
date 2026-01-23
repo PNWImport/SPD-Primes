@@ -8,6 +8,53 @@ use indicatif::{ProgressBar, ProgressStyle};
 use lazy_static::lazy_static;
 use colored::*;
 use serde::{Deserialize, Serialize};
+use sha3::{Digest, Sha3_512};
+use chrono::Utc;
+
+// ============================================================================
+// PHASETOKEN - Cryptographic proof of search session integrity
+// ============================================================================
+
+#[derive(Debug)]
+struct PhaseToken {
+    timestamp: i64,
+    session_hash: String,
+    result_hash: String,
+}
+
+impl PhaseToken {
+    fn new(session_id: &str, result: &BigUint) -> Self {
+        let timestamp = Utc::now().timestamp_millis();
+
+        let mut hasher = Sha3_512::new();
+        hasher.update(session_id.as_bytes());
+        hasher.update(timestamp.to_be_bytes());
+        let session_hash = format!("{:x}", hasher.finalize_reset());
+
+        hasher.update(result.to_bytes_be());
+        let result_hash = format!("{:x}", hasher.finalize());
+
+        PhaseToken { timestamp, session_hash, result_hash }
+    }
+
+    fn display(&self) {
+        println!("\n{}", "🔐 PhaseToken:".bright_magenta().bold());
+        println!("   ⏱️  Timestamp   : {}", self.timestamp);
+        println!("   🌱 Session Hash: {}...", &self.session_hash[..32]);
+        println!("   📦 Result Hash : {}...", &self.result_hash[..32]);
+    }
+
+    fn to_string_full(&self) -> String {
+        format!(
+            "PhaseToken\n\
+             ==========\n\
+             Timestamp: {}\n\
+             Session Hash: {}\n\
+             Result Hash: {}\n",
+            self.timestamp, self.session_hash, self.result_hash
+        )
+    }
+}
 
 // ============================================================================
 // PHASE 2: OPTIMIZED PATTERN MATRIX (Array-based for speed)
@@ -323,6 +370,8 @@ impl Statistics {
 // | Target Digits | Sequence Length              |
 // |---------------|------------------------------|
 // | ~2,466        | Config::new(4096)            |
+// | ~4,096        | Config::new(6804)            |
+// | ~4,932        | Config::new(8192)            |
 // | ~8,000        | Config::new(13300)           |
 // | ~10,000       | Config::new(16600)           |
 // | ~50,000       | Config::new(83000)           |
@@ -346,7 +395,7 @@ fn main() {
     // =========================================================================
     // 🎯 CHANGE THIS LINE TO TARGET DIFFERENT DIGIT SIZES
     // =========================================================================
-    let config = Config::new(8192);  // Target: ~4,932 digits
+    let config = Config::new(6804);  // Target: ~4,096 digits
     // =========================================================================
     
     rayon::ThreadPoolBuilder::new()
@@ -432,14 +481,19 @@ fn main() {
     match result {
         Some((prime, ent, symbols)) => {
             let digits = prime.to_str_radix(10).len();
-            
+
             println!("\n{}", "✅ 🎉 PRIME DISCOVERED!".bright_green().bold());
             println!("\n   Digits:      {}", digits.to_string().bright_white().bold());
             println!("   Entropy:     {:.6}", ent);
             println!("   Sequence:    {}", symbols.len());
-            
+
+            // Generate PhaseToken for cryptographic proof
+            let session_id = format!("QuanJP-Ultimate-{}-{}", digits, Utc::now().format("%Y%m%d"));
+            let token = PhaseToken::new(&session_id, &prime);
+            token.display();
+
             stats.print_summary(duration);
-            
+
             let filename = format!("quanjp_ultimate_{}digits.txt", digits);
             let prime_str = prime.to_str_radix(10);
             std::fs::write(&filename, format!(
@@ -449,12 +503,13 @@ fn main() {
                  Entropy: {:.6}\n\
                  Sequence Length: {}\n\
                  \n\
+                 {}\n\
                  Prime:\n{}\n\
                  \n\
                  Symbols:\n{:?}\n",
-                digits, ent, symbols.len(), prime_str, symbols
+                digits, ent, symbols.len(), token.to_string_full(), prime_str, symbols
             )).ok();
-            
+
             println!("\n{} Saved to {}", "💾".bright_green(), filename);
         }
         None => {
