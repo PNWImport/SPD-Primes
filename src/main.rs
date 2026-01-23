@@ -60,13 +60,18 @@ fn save_discovery(
 fn load_from_history(conn: &Connection, target_digits: usize) -> Vec<Vec<i8>> {
     let mut training_data = Vec::new();
 
-    // Try to load the most recent discovery close to target size first
+    // Only load patterns within ±40% of target size to avoid overhead
+    let min_digits = (target_digits as f64 * 0.6) as i32;
+    let max_digits = (target_digits as f64 * 1.4) as i32;
+
+    // Try to load the most recent discovery within acceptable range
     if let Ok(mut stmt) = conn.prepare(
         "SELECT symbols FROM discoveries
+         WHERE digits BETWEEN ? AND ?
          ORDER BY ABS(digits - ?) ASC, timestamp DESC
-         LIMIT 3"
+         LIMIT 2"
     ) {
-        if let Ok(rows) = stmt.query_map(params![target_digits as i32], |row| {
+        if let Ok(rows) = stmt.query_map(params![min_digits, max_digits, target_digits as i32], |row| {
             row.get::<_, String>(0)
         }) {
             for row in rows {
@@ -364,11 +369,14 @@ fn load_training_data() -> Vec<Vec<i8>> {
 fn load_training_data_with_history(conn: &Connection, target_digits: usize) -> Vec<Vec<i8>> {
     let mut training_data = Vec::new();
 
-    // First, try to load from database history (prefer closest digit size)
-    training_data = load_from_history(conn, target_digits);
-    if !training_data.is_empty() {
-        println!("   ✓ Loaded {} historical sequences from database", training_data.len());
-        return training_data;
+    // Only use database history for larger targets (8K+)
+    // Smaller targets are faster with hardcoded defaults due to DB overhead
+    if target_digits >= 8000 {
+        training_data = load_from_history(conn, target_digits);
+        if !training_data.is_empty() {
+            println!("   ✓ Loaded {} historical sequences from database", training_data.len());
+            return training_data;
+        }
     }
 
     // Fallback to JSON files
@@ -503,7 +511,12 @@ fn main() {
     let config = Config::new(6644);  // Target: ~4,000 digits
     // =========================================================================
 
-    let db = init_database().expect("Failed to initialize database");
+    // Only initialize DB for larger targets (8K+) to avoid overhead
+    let db = if config.target_digits() >= 8000 {
+        Some(init_database().expect("Failed to initialize database"))
+    } else {
+        None
+    };
 
     rayon::ThreadPoolBuilder::new()
         .num_threads(config.num_threads)
@@ -511,7 +524,10 @@ fn main() {
         .unwrap();
 
     println!("\n{}", "🧠 Loading & Learning Patterns...".bright_cyan().bold());
-    let training_data = load_training_data_with_history(&db, config.target_digits());
+    let training_data = match &db {
+        Some(connection) => load_training_data_with_history(connection, config.target_digits()),
+        None => load_training_data(),
+    };
     let mut pattern_matrix = PatternMatrix::new();
     
     for (idx, sequence) in training_data.iter().enumerate() {
@@ -599,11 +615,13 @@ fn main() {
             let token = PhaseToken::new(&session_id, &prime);
             token.display();
 
-            // Save discovery to database
-            if let Err(e) = save_discovery(&db, token.timestamp, digits, ent, symbols.len(), &symbols, &token.session_hash, &token.result_hash) {
-                println!("   ⚠️  Warning: Failed to save to database: {}", e);
-            } else {
-                println!("   ✓ Saved to database");
+            // Save discovery to database (if available)
+            if let Some(ref connection) = db {
+                if let Err(e) = save_discovery(connection, token.timestamp, digits, ent, symbols.len(), &symbols, &token.session_hash, &token.result_hash) {
+                    println!("   ⚠️  Warning: Failed to save to database: {}", e);
+                } else {
+                    println!("   ✓ Saved to database");
+                }
             }
 
             stats.print_summary(duration);
