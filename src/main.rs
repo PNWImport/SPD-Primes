@@ -10,6 +10,77 @@ use colored::*;
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_512};
 use chrono::Utc;
+use rusqlite::{Connection, params};
+
+// ============================================================================
+// DATABASE - Historical pattern and discovery tracking
+// ============================================================================
+
+fn init_database() -> rusqlite::Result<Connection> {
+    let conn = Connection::open("prime_history.db")?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS discoveries (
+            id INTEGER PRIMARY KEY,
+            timestamp INTEGER NOT NULL,
+            digits INTEGER NOT NULL,
+            entropy REAL NOT NULL,
+            sequence_length INTEGER NOT NULL,
+            symbols TEXT NOT NULL,
+            session_hash TEXT NOT NULL,
+            result_hash TEXT NOT NULL
+        )",
+        [],
+    )?;
+
+    Ok(conn)
+}
+
+fn save_discovery(
+    conn: &Connection,
+    timestamp: i64,
+    digits: usize,
+    entropy: f64,
+    sequence_len: usize,
+    symbols: &[i8],
+    session_hash: &str,
+    result_hash: &str,
+) -> rusqlite::Result<()> {
+    let symbols_json = serde_json::to_string(symbols).unwrap_or_default();
+
+    conn.execute(
+        "INSERT INTO discoveries (timestamp, digits, entropy, sequence_length, symbols, session_hash, result_hash)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+        params![timestamp, digits as i32, entropy, sequence_len as i32, symbols_json, session_hash, result_hash],
+    )?;
+
+    Ok(())
+}
+
+fn load_from_history(conn: &Connection, target_digits: usize) -> Vec<Vec<i8>> {
+    let mut training_data = Vec::new();
+
+    // Try to load the most recent discovery close to target size first
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT symbols FROM discoveries
+         ORDER BY ABS(digits - ?) ASC, timestamp DESC
+         LIMIT 3"
+    ) {
+        if let Ok(rows) = stmt.query_map(params![target_digits as i32], |row| {
+            row.get::<_, String>(0)
+        }) {
+            for row in rows {
+                if let Ok(symbols_json) = row {
+                    if let Ok(symbols) = serde_json::from_str::<Vec<i8>>(&symbols_json) {
+                        training_data.push(symbols);
+                    }
+                }
+            }
+        }
+    }
+
+    training_data
+}
 
 // ============================================================================
 // PHASETOKEN - Cryptographic proof of search session integrity
@@ -267,26 +338,60 @@ fn is_prime_miller_rabin(n: &BigUint, rounds: u32) -> bool {
 
 fn load_training_data() -> Vec<Vec<i8>> {
     let mut training_data = Vec::new();
-    
+
     if let Ok(data) = std::fs::read_to_string("prime_1233_symbols.json") {
         if let Ok(symbols) = serde_json::from_str::<Vec<i8>>(&data) {
             training_data.push(symbols);
         }
     }
-    
+
     if let Ok(data) = std::fs::read_to_string("prime_2466_symbols.json") {
         if let Ok(symbols) = serde_json::from_str::<Vec<i8>>(&data) {
             training_data.push(symbols);
         }
     }
-    
+
     if training_data.is_empty() {
         training_data = vec![
             vec![-1, -1, -1, -1, -1, -1, -1, 1, 0, -1, 2, 2, 1, -1, 2, 0],
             vec![-1, 1, 0, -1, 0, 0, 0, 1, 1, -1, 1, -1, 1, 1, 1, -1],
         ];
     }
-    
+
+    training_data
+}
+
+fn load_training_data_with_history(conn: &Connection, target_digits: usize) -> Vec<Vec<i8>> {
+    let mut training_data = Vec::new();
+
+    // First, try to load from database history (prefer closest digit size)
+    training_data = load_from_history(conn, target_digits);
+    if !training_data.is_empty() {
+        println!("   ✓ Loaded {} historical sequences from database", training_data.len());
+        return training_data;
+    }
+
+    // Fallback to JSON files
+    if let Ok(data) = std::fs::read_to_string("prime_1233_symbols.json") {
+        if let Ok(symbols) = serde_json::from_str::<Vec<i8>>(&data) {
+            training_data.push(symbols);
+        }
+    }
+
+    if let Ok(data) = std::fs::read_to_string("prime_2466_symbols.json") {
+        if let Ok(symbols) = serde_json::from_str::<Vec<i8>>(&data) {
+            training_data.push(symbols);
+        }
+    }
+
+    // Fallback to hardcoded defaults
+    if training_data.is_empty() {
+        training_data = vec![
+            vec![-1, -1, -1, -1, -1, -1, -1, 1, 0, -1, 2, 2, 1, -1, 2, 0],
+            vec![-1, 1, 0, -1, 0, 0, 0, 1, 1, -1, 1, -1, 1, 1, 1, -1],
+        ];
+    }
+
     training_data
 }
 
@@ -383,28 +488,30 @@ fn main() {
     println!("\n{}", "🚀 QuanJP Prime Hunter 2050 - ULTIMATE EDITION".bright_green().bold());
     println!("{}", "   ⚡ ADI + Universal Equation + Full Optimizations".bright_yellow());
     println!("{}\n", "━".repeat(70).bright_blue());
-    
+
     let physical_cpus = num_cpus::get_physical();
     let logical_cpus = num_cpus::get();
-    
+
     println!("{}", "💻 System Detection:".bright_cyan().bold());
     println!("   Physical CPUs:  {}", physical_cpus);
     println!("   Logical CPUs:   {}", logical_cpus);
     println!("   Using threads:  {} (CPU - 1 for OS)", (physical_cpus.saturating_sub(1).max(1)).to_string().bright_green().bold());
-    
+
     // =========================================================================
     // 🎯 CHANGE THIS LINE TO TARGET DIFFERENT DIGIT SIZES
     // =========================================================================
     let config = Config::new(13609);  // Target: ~8,192 digits
     // =========================================================================
-    
+
+    let db = init_database().expect("Failed to initialize database");
+
     rayon::ThreadPoolBuilder::new()
         .num_threads(config.num_threads)
         .build_global()
         .unwrap();
-    
+
     println!("\n{}", "🧠 Loading & Learning Patterns...".bright_cyan().bold());
-    let training_data = load_training_data();
+    let training_data = load_training_data_with_history(&db, config.target_digits());
     let mut pattern_matrix = PatternMatrix::new();
     
     for (idx, sequence) in training_data.iter().enumerate() {
@@ -491,6 +598,13 @@ fn main() {
             let session_id = format!("QuanJP-Ultimate-{}-{}", digits, Utc::now().format("%Y%m%d"));
             let token = PhaseToken::new(&session_id, &prime);
             token.display();
+
+            // Save discovery to database
+            if let Err(e) = save_discovery(&db, token.timestamp, digits, ent, symbols.len(), &symbols, &token.session_hash, &token.result_hash) {
+                println!("   ⚠️  Warning: Failed to save to database: {}", e);
+            } else {
+                println!("   ✓ Saved to database");
+            }
 
             stats.print_summary(duration);
 
