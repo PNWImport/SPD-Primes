@@ -24,7 +24,7 @@ path = "src/main.rs"
 
 [[bin]]
 name = "ingest-history"
-path = "ingest_history.rs"
+path = "src/bin/ingest_history.rs"
 
 [profile.release]
 opt-level = 3
