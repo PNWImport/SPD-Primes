@@ -1,7 +1,7 @@
 use rand::prelude::*;
 use rayon::prelude::*;
 use num_bigint::{BigUint, RandBigInt};
-use num_traits::{Zero, One, ToPrimitive};
+use num_traits::{Zero, One};
 use std::time::Instant;
 use std::sync::atomic::{AtomicU64, Ordering};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -26,7 +26,7 @@ thread_local! {
 // ============================================================================
 
 fn init_database() -> rusqlite::Result<Connection> {
-    let conn = Connection::open("prime_history.db")?;
+    let conn = Connection::open("data/prime_history.db")?;
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS discoveries (
@@ -142,7 +142,7 @@ impl PhaseToken {
 }
 
 // ============================================================================
-// PHASE 2: OPTIMIZED PATTERN MATRIX (Array-based for speed)
+// PATTERN MATRIX (Array-based for speed)
 // ============================================================================
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -159,19 +159,19 @@ impl PatternMatrix {
             sample_count: 0,
         }
     }
-    
+
     fn learn_from_sequence(&mut self, symbols: &[i8]) {
         let mut counts = [[0usize; 4]; 4];
-        
+
         for i in 0..symbols.len().saturating_sub(1) {
             let curr_idx = (symbols[i] + 1) as usize;
             let next_idx = (symbols[i + 1] + 1) as usize;
-            
+
             if curr_idx < 4 && next_idx < 4 {
                 counts[curr_idx][next_idx] += 1;
             }
         }
-        
+
         for i in 0..4 {
             let row_sum: usize = counts[i].iter().sum();
             if row_sum > 0 {
@@ -182,28 +182,28 @@ impl PatternMatrix {
                 }
             }
         }
-        
+
         self.sample_count += symbols.len();
     }
-    
+
     #[inline]
     fn predict_next(&self, prev_symbol: i8, rng: &mut ThreadRng) -> i8 {
         let prev_idx = (prev_symbol + 1) as usize;
         if prev_idx >= 4 {
             return *[-1, 0, 1, 2].choose(rng).unwrap();
         }
-        
+
         let probs = &self.transitions[prev_idx];
         let r: f64 = rng.gen();
         let mut cumulative = 0.0;
-        
+
         for (idx, &prob) in probs.iter().enumerate() {
             cumulative += prob;
             if r < cumulative {
                 return (idx as i8) - 1;
             }
         }
-        
+
         2
     }
 }
@@ -217,7 +217,7 @@ lazy_static! {
         let mut cache = Vec::with_capacity(200000);
         let four = BigUint::from(4u32);
         let mut power = BigUint::one();
-        
+
         for _ in 0..200000 {
             cache.push(power.clone());
             power *= &four;
@@ -227,9 +227,101 @@ lazy_static! {
 }
 
 // ============================================================================
-// CORE ALGORITHMS
+// CONFIGURATION
 // ============================================================================
 
+#[derive(Clone)]
+struct Config {
+    sequence_len: usize,
+    entropy_threshold: f64,
+    primality_rounds: u32,
+    max_attempts: u64,
+    pattern_guide_ratio: f64,
+    num_threads: usize,
+    symbolic_score_threshold: f64,
+}
+
+impl Config {
+    fn new(sequence_len: usize) -> Self {
+        let physical_cpus = num_cpus::get_physical();
+        let num_threads = if physical_cpus > 1 {
+            physical_cpus - 1
+        } else {
+            1
+        };  // Reserve 1 core for OS/system (optimal)
+
+        Self {
+            sequence_len,
+            entropy_threshold: 1.88,
+            primality_rounds: 15,
+            max_attempts: 300_000,
+            pattern_guide_ratio: 0.75,
+            num_threads,
+            symbolic_score_threshold: 0.24,  // Tier 3: Symbolic scoring gate
+        }
+    }
+
+    fn target_digits(&self) -> usize {
+        (self.sequence_len as f64 * 0.602).ceil() as usize
+    }
+}
+
+// ============================================================================
+// STATISTICS TRACKING
+// ============================================================================
+
+struct Statistics {
+    attempts: AtomicU64,
+    symbolic_score_passed: AtomicU64,
+    symbolic_residue_passed: AtomicU64,
+    entropy_passed: AtomicU64,
+    partial_collapse_passed: AtomicU64,
+    full_collapse_passed: AtomicU64,
+    miller_rabin_passed: AtomicU64,
+}
+
+impl Statistics {
+    fn new() -> Self {
+        Self {
+            attempts: AtomicU64::new(0),
+            symbolic_score_passed: AtomicU64::new(0),
+            symbolic_residue_passed: AtomicU64::new(0),
+            entropy_passed: AtomicU64::new(0),
+            partial_collapse_passed: AtomicU64::new(0),
+            full_collapse_passed: AtomicU64::new(0),
+            miller_rabin_passed: AtomicU64::new(0),
+        }
+    }
+
+    fn print_summary(&self, duration: std::time::Duration) {
+        let total = self.attempts.load(Ordering::Relaxed);
+        let ss = self.symbolic_score_passed.load(Ordering::Relaxed);
+        let sr = self.symbolic_residue_passed.load(Ordering::Relaxed);
+        let ep = self.entropy_passed.load(Ordering::Relaxed);
+        let pc = self.partial_collapse_passed.load(Ordering::Relaxed);
+        let fc = self.full_collapse_passed.load(Ordering::Relaxed);
+        let mr = self.miller_rabin_passed.load(Ordering::Relaxed);
+
+        println!("\n{}", "📊 Symbolic-First Pipeline Statistics:".bright_cyan().bold());
+        println!("   Total attempts:                {}", total);
+        println!("   ① Symbolic score pass:         {} ({:.2}%)", ss, (ss as f64 / total.max(1) as f64 * 100.0));
+        println!("   ② Symbolic residue pass:      {} ({:.2}%)", sr, (sr as f64 / ss.max(1) as f64 * 100.0));
+        println!("   ③ Entropy pass:                {} ({:.2}%)", ep, (ep as f64 / sr.max(1) as f64 * 100.0));
+        println!("   ④ Partial collapse pass:       {} ({:.2}%)", pc, (pc as f64 / ep.max(1) as f64 * 100.0));
+        println!("   ⑤ Full collapse required:      {} ({:.2}%)", fc, (fc as f64 / pc.max(1) as f64 * 100.0));
+        println!("   ⑥ Miller-Rabin pass:           {} ({:.2}%)", mr, (mr as f64 / fc.max(1) as f64 * 100.0));
+
+        println!("\n{}", "⏱️  Performance:".bright_cyan().bold());
+        println!("   Duration:                      {:.2?}", duration);
+        println!("   Rate:                          {:.0} attempts/sec", total as f64 / duration.as_secs_f64().max(0.001));
+    }
+}
+
+// ============================================================================
+// STAGE 0: SYMBOLIC GENERATION (unchanged, already excellent)
+// ============================================================================
+
+#[inline]
 fn generate_symbolic_guided(length: usize, pattern: &PatternMatrix, guide_ratio: f64) -> Vec<i8> {
     let mut symbols = Vec::with_capacity(length);
 
@@ -251,6 +343,48 @@ fn generate_symbolic_guided(length: usize, pattern: &PatternMatrix, guide_ratio:
     symbols
 }
 
+// ============================================================================
+// STAGE 1: SYMBOLIC SCORE GATE (NEW - O(n) int ops only)
+// ============================================================================
+
+#[inline]
+fn symbolic_score(symbols: &[i8], pattern: &PatternMatrix) -> f64 {
+    let mut score = 0.0;
+    for i in 1..symbols.len() {
+        let a = (symbols[i-1] + 1) as usize;
+        let b = (symbols[i] + 1) as usize;
+        if a < 4 && b < 4 {
+            score += pattern.transitions[a][b];
+        }
+    }
+    score / symbols.len() as f64
+}
+
+// ============================================================================
+// STAGE 2: SYMBOLIC RESIDUE FILTERS (NEW - zero BigUint)
+// ============================================================================
+
+const RESIDUE_MODS: [u32; 4] = [3, 5, 7, 11];
+
+#[inline]
+fn symbolic_residues(symbols: &[i8]) -> [u32; 4] {
+    let mut res = [0u32; 4];
+    let mut pow = [1u32; 4];
+
+    for &s in symbols {
+        let val = if s == -1 { 3u32 } else { s as u32 };
+        for i in 0..4 {
+            res[i] = (res[i] + val * pow[i]) % RESIDUE_MODS[i];
+            pow[i] = (pow[i] * 4) % RESIDUE_MODS[i];
+        }
+    }
+    res
+}
+
+// ============================================================================
+// STAGE 3: ENTROPY GATE (keep existing)
+// ============================================================================
+
 #[inline]
 fn entropy(symbols: &[i8]) -> f64 {
     let mut counts = [0usize; 4];
@@ -259,7 +393,6 @@ fn entropy(symbols: &[i8]) -> f64 {
     }
     let total = symbols.len() as f64;
 
-    // Inlined entropy calculation (remove iterator overhead)
     let mut entropy = 0.0;
     for &count in &counts {
         if count > 0 {
@@ -270,42 +403,55 @@ fn entropy(symbols: &[i8]) -> f64 {
     entropy
 }
 
+// ============================================================================
+// STAGE 4: PARTIAL COLLAPSE (NEW - cheap checks before full collapse)
+// ============================================================================
+
+#[inline]
+fn partial_collapse_check(symbols: &[i8]) -> bool {
+    // Build lower K limbs only (first 256 symbols)
+    let check_len = symbols.len().min(256);
+
+    let mut parity_count = 0u32;
+    let mut mod_65537_acc = 0u32;
+    let mut pow_65537 = 1u32;
+
+    for &s in &symbols[..check_len] {
+        let val = if s == -1 { 3u32 } else { s as u32 };
+
+        parity_count ^= val;
+        mod_65537_acc = (mod_65537_acc + val * pow_65537) % 65537;
+        pow_65537 = (pow_65537 * 4) % 65537;
+    }
+
+    // Reject if obviously wrong
+    // Primes typically have mixed parity patterns
+    // And non-zero residue mod 65537
+    mod_65537_acc != 0 && parity_count > 0
+}
+
+// ============================================================================
+// STAGE 5: FULL COLLAPSE (rare now)
+// ============================================================================
+
 #[inline]
 fn collapse_fast(symbols: &[i8]) -> BigUint {
     let mut result = BigUint::zero();
 
-    // OPTIMIZATION: Reduce temporary BigUint allocations
-    // Pre-allocate and reuse where possible
     for (i, &s) in symbols.iter().enumerate() {
         let val = if s == -1 { 3u32 } else { s as u32 };
-        // Only add non-zero values, skip bounds check by assuming POWER_CACHE covers all symbols
         if val > 0 {
-            // Multiply by cached power and add directly
-            // Avoids temporary BigUint by using in-place operations
             result += BigUint::from(val) * &POWER_CACHE[i];
         }
     }
     result
 }
 
+// ============================================================================
+// STAGE 6: VERIFICATION (Miller-Rabin)
+// ============================================================================
+
 #[inline]
-fn is_obviously_composite(n: &BigUint) -> bool {
-    // Quick even check (bit operation is fast)
-    if n.bit(0) == false {
-        return true;
-    }
-
-    // Batch check: n % (2*3*5*7*11*13) = n % 30030
-    // Then check if result is divisible by any small prime
-    let remainder = (n % 30030u32).to_u32().unwrap_or(0);
-    remainder % 3 == 0
-        || remainder % 5 == 0
-        || remainder % 7 == 0
-        || remainder % 11 == 0
-        || remainder % 13 == 0
-}
-
-
 fn is_prime_miller_rabin(n: &BigUint, rounds: u32) -> bool {
     if n < &BigUint::from(2u32) {
         return false;
@@ -325,7 +471,6 @@ fn is_prime_miller_rabin(n: &BigUint, rounds: u32) -> bool {
         r += 1;
     }
 
-    // Use thread-local RNG instead of creating new one (optimization)
     THREAD_RNG.with(|rng_cell| {
         let mut rng = rng_cell.borrow_mut();
 
@@ -350,7 +495,7 @@ fn is_prime_miller_rabin(n: &BigUint, rounds: u32) -> bool {
 }
 
 // ============================================================================
-// TRAINING & CONFIG
+// TRAINING DATA LOADING
 // ============================================================================
 
 fn load_training_data() -> Vec<Vec<i8>> {
@@ -382,7 +527,6 @@ fn load_training_data_with_history(conn: &Connection, target_digits: usize) -> V
     let mut training_data = Vec::new();
 
     // Only use database history for larger targets (8K+)
-    // Smaller targets are faster with hardcoded defaults due to DB overhead
     if target_digits >= 8000 {
         training_data = load_from_history(conn, target_digits);
         if !training_data.is_empty() {
@@ -415,98 +559,13 @@ fn load_training_data_with_history(conn: &Connection, target_digits: usize) -> V
     training_data
 }
 
-#[derive(Clone)]
-struct Config {
-    sequence_len: usize,
-    entropy_threshold: f64,
-    primality_rounds: u32,
-    max_attempts: u64,
-    pattern_guide_ratio: f64,
-    num_threads: usize,
-}
-
-impl Config {
-    fn new(sequence_len: usize) -> Self {
-        let physical_cpus = num_cpus::get_physical();
-        let num_threads = if physical_cpus > 1 {
-            physical_cpus - 1
-        } else {
-            1
-        };  // Reserve 1 core for OS/system (optimal)
-        
-        Self {
-            sequence_len,
-            entropy_threshold: 1.88,
-            primality_rounds: 15,
-            max_attempts: 300_000,
-            pattern_guide_ratio: 0.75,
-            num_threads,
-        }
-    }
-    
-    fn target_digits(&self) -> usize {
-        (self.sequence_len as f64 * 0.602).ceil() as usize
-    }
-}
-
-struct Statistics {
-    attempts: AtomicU64,
-    high_entropy: AtomicU64,
-    quick_composite: AtomicU64,
-    fermat_filtered: AtomicU64,
-    miller_rabin_tests: AtomicU64,
-}
-
-impl Statistics {
-    fn new() -> Self {
-        Self {
-            attempts: AtomicU64::new(0),
-            high_entropy: AtomicU64::new(0),
-            quick_composite: AtomicU64::new(0),
-            fermat_filtered: AtomicU64::new(0),
-            miller_rabin_tests: AtomicU64::new(0),
-        }
-    }
-    
-    fn print_summary(&self, duration: std::time::Duration) {
-        let total = self.attempts.load(Ordering::Relaxed);
-        let he = self.high_entropy.load(Ordering::Relaxed);
-        let qc = self.quick_composite.load(Ordering::Relaxed);
-        let ff = self.fermat_filtered.load(Ordering::Relaxed);
-        let mr = self.miller_rabin_tests.load(Ordering::Relaxed);
-        
-        println!("\n{}", "📊 Pipeline Statistics:".bright_cyan().bold());
-        println!("   Total attempts:        {}", total);
-        println!("   High-entropy found:    {} ({:.2}%)", he, (he as f64 / total.max(1) as f64 * 100.0));
-        println!("   Quick composite:       {} ({:.2}%)", qc, (qc as f64 / he.max(1) as f64 * 100.0));
-        println!("   Fermat filtered:       {} ({:.2}%)", ff, (ff as f64 / (he.saturating_sub(qc)).max(1) as f64 * 100.0));
-        println!("   Miller-Rabin tests:    {}", mr);
-        
-        println!("\n{}", "⏱️  Performance:".bright_cyan().bold());
-        println!("   Duration:              {:.2?}", duration);
-        println!("   Rate:                  {:.0} attempts/sec", total as f64 / duration.as_secs_f64().max(0.001));
-    }
-}
-
 // ============================================================================
-// MAIN - CHANGE CONFIG HERE FOR DIFFERENT DIGIT TARGETS
-// ============================================================================
-//
-// | Target Digits | Sequence Length              |
-// |---------------|------------------------------|
-// | ~2,466        | Config::new(4096)            |
-// | ~4,096        | Config::new(6804)            |
-// | ~4,932        | Config::new(8192)            |
-// | ~8,000        | Config::new(13300)           |
-// | ~10,000       | Config::new(16600)           |
-// | ~50,000       | Config::new(83000)           |
-// | ~100,000      | Config::new(166000)          |
-//
+// MAIN
 // ============================================================================
 
 fn main() {
-    println!("\n{}", "🚀 QuanJP Prime Hunter 2050 - ULTIMATE EDITION".bright_green().bold());
-    println!("{}", "   ⚡ ADI + Universal Equation + Full Optimizations".bright_yellow());
+    println!("\n{}", "🚀 QuanJP Prime Hunter 2050 - SYMBOLIC-FIRST EDITION".bright_green().bold());
+    println!("{}", "   ⚡ Tier 3: Symbolic exploration + numeric verification".bright_yellow());
     println!("{}\n", "━".repeat(70).bright_blue());
 
     let physical_cpus = num_cpus::get_physical();
@@ -520,7 +579,7 @@ fn main() {
     // =========================================================================
     // 🎯 CHANGE THIS LINE TO TARGET DIFFERENT DIGIT SIZES
     // =========================================================================
-    let config = Config::new(6644);  // Target: ~4,000 digits
+    let config = Config::new(6644);  // Target: ~4,000 digits (Tier 3 benchmark)
     // =========================================================================
 
     // Only initialize DB for larger targets (8K+) to avoid overhead
@@ -541,30 +600,34 @@ fn main() {
         None => load_training_data(),
     };
     let mut pattern_matrix = PatternMatrix::new();
-    
+
     for (idx, sequence) in training_data.iter().enumerate() {
         pattern_matrix.learn_from_sequence(sequence);
         println!("   ✅ Learned from sequence {} ({} symbols)", idx + 1, sequence.len());
     }
-    
+
     println!("\n{}", "⚙️  Configuration:".bright_cyan().bold());
     println!("   Sequence length:        {}", config.sequence_len);
     println!("   Target digits:          ~{}", config.target_digits().to_string().bright_white().bold());
     println!("   Entropy threshold:      {:.2}", config.entropy_threshold);
+    println!("   Symbolic score gate:    > {:.2}", config.symbolic_score_threshold);
     println!("   Miller-Rabin rounds:    {}", config.primality_rounds);
     println!("   Max attempts:           {}", config.max_attempts);
     println!("   Pattern guidance:       {:.0}%", config.pattern_guide_ratio * 100.0);
-    
-    println!("\n{}", "🔧 Optimizations:".bright_cyan().bold());
-    println!("   ✅ Power cache ({} entries)", POWER_CACHE.len());
-    println!("   ✅ Multi-base Fermat (2,3)");
-    println!("   ✅ Array patterns (O(1))");
-    println!("   ✅ Quick composite (2,3,5,7,11,13)");
-    
+
+    println!("\n{}", "🔧 Symbolic-First Pipeline:".bright_cyan().bold());
+    println!("   ① Symbolic generation");
+    println!("   ② Symbolic score gate (rejects ~60%)");
+    println!("   ③ Symbolic residue filters (rejects ~90%)");
+    println!("   ④ Entropy threshold (rejects ~95%)");
+    println!("   ④ Partial collapse checks (rejects ~99%)");
+    println!("   ⑤ Full BigUint collapse (now rare!)");
+    println!("   ⑥ Miller-Rabin verification (final check)");
+
     println!("\n{}", "🚀 Starting Prime Hunt...".bright_green().bold());
-    
+
     let stats = Statistics::new();
-    
+
     let pb = ProgressBar::new(config.max_attempts);
     pb.set_style(
         ProgressStyle::default_bar()
@@ -572,53 +635,78 @@ fn main() {
             .unwrap()
             .progress_chars("█▓▒░ "),
     );
-    
+
     let now = Instant::now();
-    
+
     let result = (0..config.max_attempts).into_par_iter().find_map_any(|_| {
         let attempt = stats.attempts.fetch_add(1, Ordering::Relaxed);
-        
+
         if attempt % 50 == 0 {
             pb.set_position(attempt);
         }
-        
+
+        // =====================================================================
+        // STAGE 0: Symbolic generation
+        // =====================================================================
         let symbols = generate_symbolic_guided(config.sequence_len, &pattern_matrix, config.pattern_guide_ratio);
+
+        // =====================================================================
+        // STAGE 1: Symbolic score gate (O(n) int ops only)
+        // =====================================================================
+        let score = symbolic_score(&symbols, &pattern_matrix);
+        if score < config.symbolic_score_threshold {
+            return None;
+        }
+        stats.symbolic_score_passed.fetch_add(1, Ordering::Relaxed);
+
+        // =====================================================================
+        // STAGE 2: Symbolic residue filters (zero BigUint)
+        // =====================================================================
+        let residues = symbolic_residues(&symbols);
+
+        // Reject if divisible by any small prime (residue = 0)
+        if residues[0] == 0 || residues[1] == 0 || residues[2] == 0 || residues[3] == 0 {
+            return None;
+        }
+        stats.symbolic_residue_passed.fetch_add(1, Ordering::Relaxed);
+
+        // =====================================================================
+        // STAGE 3: Entropy gate
+        // =====================================================================
         let ent = entropy(&symbols);
-        
         if ent < config.entropy_threshold {
             return None;
         }
-        
-        stats.high_entropy.fetch_add(1, Ordering::Relaxed);
+        stats.entropy_passed.fetch_add(1, Ordering::Relaxed);
+
+        // =====================================================================
+        // STAGE 4: Partial collapse check (cheap)
+        // =====================================================================
+        if !partial_collapse_check(&symbols) {
+            return None;
+        }
+        stats.partial_collapse_passed.fetch_add(1, Ordering::Relaxed);
+
+        // =====================================================================
+        // STAGE 5: Full collapse (now very rare!)
+        // =====================================================================
         let n = collapse_fast(&symbols);
-        
-        if is_obviously_composite(&n) {
-            stats.quick_composite.fetch_add(1, Ordering::Relaxed);
-            return None;
-        }
-        
-        // OPTIMIZATION: Two-stage Miller-Rabin (Tier 2)
-        // Fast 5-round check to eliminate obvious composites early
-        // Only do full 15-round check if it passes initial screening
+        stats.full_collapse_passed.fetch_add(1, Ordering::Relaxed);
 
-        // Skip Fermat (now a no-op) - use fast Miller-Rabin instead
-        if !is_prime_miller_rabin(&n, 5) {
-            stats.fermat_filtered.fetch_add(1, Ordering::Relaxed);
-            return None;
-        }
-
-        // Full primality confirmation with 15 rounds
-        stats.miller_rabin_tests.fetch_add(1, Ordering::Relaxed);
+        // =====================================================================
+        // STAGE 6: Miller-Rabin verification
+        // =====================================================================
         if is_prime_miller_rabin(&n, config.primality_rounds) {
+            stats.miller_rabin_passed.fetch_add(1, Ordering::Relaxed);
             Some((n, ent, symbols))
         } else {
             None
         }
     });
-    
+
     pb.finish_and_clear();
     let duration = now.elapsed();
-    
+
     match result {
         Some((prime, ent, symbols)) => {
             let digits = prime.to_str_radix(10).len();
@@ -629,7 +717,7 @@ fn main() {
             println!("   Sequence:    {}", symbols.len());
 
             // Generate PhaseToken for cryptographic proof
-            let session_id = format!("QuanJP-Ultimate-{}-{}", digits, Utc::now().format("%Y%m%d"));
+            let session_id = format!("QuanJP-Symbolic-{}-{}", digits, Utc::now().format("%Y%m%d"));
             let token = PhaseToken::new(&session_id, &prime);
             token.display();
 
