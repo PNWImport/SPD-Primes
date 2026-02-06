@@ -416,7 +416,11 @@ struct Config {
 impl Config {
     fn new(sequence_len: usize) -> Self {
         let physical_cpus = num_cpus::get_physical();
-        let num_threads = physical_cpus;  // Use all available cores
+        let num_threads = if physical_cpus > 1 {
+            physical_cpus - 1
+        } else {
+            1
+        };  // Reserve 1 core for OS/system (optimal)
         
         Self {
             sequence_len,
@@ -499,7 +503,7 @@ fn main() {
     println!("{}", "💻 System Detection:".bright_cyan().bold());
     println!("   Physical CPUs:  {}", physical_cpus);
     println!("   Logical CPUs:   {}", logical_cpus);
-    println!("   Using threads:  {} (all cores)", physical_cpus.to_string().bright_green().bold());
+    println!("   Using threads:  {} (CPU - 1 for OS)", (physical_cpus.saturating_sub(1).max(1)).to_string().bright_green().bold());
 
     // =========================================================================
     // 🎯 CHANGE THIS LINE TO TARGET DIFFERENT DIGIT SIZES
