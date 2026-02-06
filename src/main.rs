@@ -416,11 +416,7 @@ struct Config {
 impl Config {
     fn new(sequence_len: usize) -> Self {
         let physical_cpus = num_cpus::get_physical();
-        let num_threads = if physical_cpus > 1 {
-            physical_cpus - 1
-        } else {
-            1
-        };
+        let num_threads = physical_cpus;  // Use all available cores
         
         Self {
             sequence_len,
@@ -503,12 +499,12 @@ fn main() {
     println!("{}", "💻 System Detection:".bright_cyan().bold());
     println!("   Physical CPUs:  {}", physical_cpus);
     println!("   Logical CPUs:   {}", logical_cpus);
-    println!("   Using threads:  {} (CPU - 1 for OS)", (physical_cpus.saturating_sub(1).max(1)).to_string().bright_green().bold());
+    println!("   Using threads:  {} (all cores)", physical_cpus.to_string().bright_green().bold());
 
     // =========================================================================
     // 🎯 CHANGE THIS LINE TO TARGET DIFFERENT DIGIT SIZES
     // =========================================================================
-    let config = Config::new(13300);  // Target: ~8,000 digits
+    let config = Config::new(6644);  // Target: ~4,000 digits
     // =========================================================================
 
     // Only initialize DB for larger targets (8K+) to avoid overhead
