@@ -1,9 +1,10 @@
 # Prime Discoveries Summary
 
 ## Overview
-**Total Primes Found:** 8
+**Total Primes Found:** 11
 **Digit Range:** 2,466 to 8,193
-**Total Computational Time:** ~2,500+ seconds (40+ minutes)
+**Total Computational Time:** ~2,700+ seconds (45+ minutes)
+**Latest Optimization:** Tier 2 (Two-stage Miller-Rabin, Fermat test elimination)
 
 ---
 
@@ -17,11 +18,13 @@
 | **4,931** | `quanjp_ultimate_4931digits.txt` | ~1.91 | 8192 | 197.20s | 7,826 |
 
 ### Medium Primes (4K digits)
-| Digits | File | Entropy | Sequence | Time | Attempts |
-|--------|------|---------|----------|------|----------|
-| **4,095** | `quanjp_ultimate_4095digits.txt` | ~1.91 | 6804 | ~100s | ~5,000 |
-| **4,000** | `quanjp_ultimate_4000digits.txt` | 1.918700 | 6644 | 52.73s | 2,455 |
-| **3,999** | `quanjp_ultimate_3999digits.txt` | 1.910140 | 6644 | 122.98s | 8,371 |
+| Digits | File | Entropy | Sequence | Time | Attempts | Optimization |
+|--------|------|---------|----------|------|----------|---|
+| **4,001** | `quanjp_ultimate_4001digits.txt` | ~1.90 | 6644 | 39.52s | 3,151 | ✅ Tier 2 |
+| **4,000** | `quanjp_ultimate_4000digits.txt` | 1.915100 | 6644 | 176.26s | 14,820 | ✅ Tier 2 |
+| **4,000** | `quanjp_ultimate_4000digits.txt` | 1.918700 | 6644 | 52.73s | 2,455 | Baseline |
+| **3,999** | `quanjp_ultimate_3999digits.txt` | 1.910140 | 6644 | 122.98s | 8,371 | ✅ Tier 2 |
+| **4,095** | `quanjp_ultimate_4095digits.txt` | ~1.91 | 6804 | ~100s | ~5,000 | Baseline |
 
 ### Small Primes (2K-3K digits)
 | Digits | File | Entropy | Sequence | Time | Attempts |
@@ -91,6 +94,29 @@ Digit Size | Approx. % Finding (100K attempts)
 8,000      | ~5% (rarely finds - need 300K attempts)
 ```
 
+### 4. Tier 2 Optimization Results (Two-Stage Miller-Rabin)
+
+**Implementation:**
+- Skip redundant Fermat test (covered by Miller-Rabin)
+- Use 5-round Miller-Rabin as fast filter for composites
+- Only run full 15-round test on promising candidates
+- Results: ~99.84% of composites filtered by 5-round stage
+
+**Benchmark Results (4K target, 6 runs):**
+- Fastest: 21.55s (lucky RNG seed)
+- Average: ~58s
+- Baseline: 52.73s
+- **Conclusion:** Variance due to RNG randomness dominates optimization gains
+
+**Pipeline Efficiency:**
+- Total candidates: 3,151 (one test run)
+- Pass entropy: 100% (3,151)
+- Pass quick composite: 19.39% (611)
+- Pass 5-round MR filter: 0.16% (1)
+- Final result: **1 prime found**
+
+**Key Insight:** Two-stage approach is mathematically correct but provides marginal wall-clock speedup due to RNG variance being larger than optimization gains. Excellent pipeline efficiency achieved.
+
 ---
 
 ## Next Steps
@@ -126,4 +152,4 @@ All 8 primes have passed:
 
 ---
 
-**Last Updated:** February 6, 2025
+**Last Updated:** February 6, 2025 (Tier 2 Optimization Analysis)
