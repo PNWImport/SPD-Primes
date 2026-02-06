@@ -257,7 +257,7 @@ impl Config {
             max_attempts: 300_000,
             pattern_guide_ratio: 0.75,
             num_threads,
-            symbolic_score_threshold: 0.24,  // Tier 3: Symbolic scoring gate
+            symbolic_score_threshold: 0.24,  // Tier 3: Baseline (patterns naturally score high)
         }
     }
 
@@ -427,7 +427,9 @@ fn partial_collapse_check(symbols: &[i8]) -> bool {
     // Reject if obviously wrong
     // Primes typically have mixed parity patterns
     // And non-zero residue mod 65537
-    mod_65537_acc != 0 && parity_count > 0
+    // Also reject if parity is too imbalanced
+    let balanced_parity = parity_count > 0 && parity_count < 256;
+    mod_65537_acc != 0 && balanced_parity
 }
 
 // ============================================================================
