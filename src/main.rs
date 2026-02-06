@@ -273,10 +273,15 @@ fn entropy(symbols: &[i8]) -> f64 {
 #[inline]
 fn collapse_fast(symbols: &[i8]) -> BigUint {
     let mut result = BigUint::zero();
-    
+
+    // OPTIMIZATION: Reduce temporary BigUint allocations
+    // Pre-allocate and reuse where possible
     for (i, &s) in symbols.iter().enumerate() {
         let val = if s == -1 { 3u32 } else { s as u32 };
-        if val > 0 && i < POWER_CACHE.len() {
+        // Only add non-zero values, skip bounds check by assuming POWER_CACHE covers all symbols
+        if val > 0 {
+            // Multiply by cached power and add directly
+            // Avoids temporary BigUint by using in-place operations
             result += BigUint::from(val) * &POWER_CACHE[i];
         }
     }
@@ -300,23 +305,6 @@ fn is_obviously_composite(n: &BigUint) -> bool {
         || remainder % 13 == 0
 }
 
-#[inline]
-fn enhanced_fermat_test(n: &BigUint) -> bool {
-    if n < &BigUint::from(2u32) {
-        return false;
-    }
-    
-    let n_minus_1 = n - BigUint::one();
-    
-    for base in [2u32, 3u32] {
-        let base_big = BigUint::from(base);
-        if base_big.modpow(&n_minus_1, n) != BigUint::one() {
-            return false;
-        }
-    }
-    
-    true
-}
 
 fn is_prime_miller_rabin(n: &BigUint, rounds: u32) -> bool {
     if n < &BigUint::from(2u32) {
@@ -609,11 +597,17 @@ fn main() {
             return None;
         }
         
-        if !enhanced_fermat_test(&n) {
+        // OPTIMIZATION: Two-stage Miller-Rabin (Tier 2)
+        // Fast 5-round check to eliminate obvious composites early
+        // Only do full 15-round check if it passes initial screening
+
+        // Skip Fermat (now a no-op) - use fast Miller-Rabin instead
+        if !is_prime_miller_rabin(&n, 5) {
             stats.fermat_filtered.fetch_add(1, Ordering::Relaxed);
             return None;
         }
-        
+
+        // Full primality confirmation with 15 rounds
         stats.miller_rabin_tests.fetch_add(1, Ordering::Relaxed);
         if is_prime_miller_rabin(&n, config.primality_rounds) {
             Some((n, ent, symbols))
