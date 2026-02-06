@@ -1,7 +1,7 @@
 use rand::prelude::*;
 use rayon::prelude::*;
 use num_bigint::{BigUint, RandBigInt};
-use num_traits::{Zero, One};
+use num_traits::{Zero, One, ToPrimitive};
 use std::time::Instant;
 use std::sync::atomic::{AtomicU64, Ordering};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -11,6 +11,15 @@ use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_512};
 use chrono::Utc;
 use rusqlite::{Connection, params};
+use std::cell::RefCell;
+
+// ============================================================================
+// THREAD-LOCAL RNG (Optimization: avoid RNG allocation overhead)
+// ============================================================================
+
+thread_local! {
+    static THREAD_RNG: RefCell<ThreadRng> = RefCell::new(thread_rng());
+}
 
 // ============================================================================
 // DATABASE - Historical pattern and discovery tracking
@@ -222,20 +231,23 @@ lazy_static! {
 // ============================================================================
 
 fn generate_symbolic_guided(length: usize, pattern: &PatternMatrix, guide_ratio: f64) -> Vec<i8> {
-    let mut rng = thread_rng();
     let mut symbols = Vec::with_capacity(length);
-    
-    symbols.push(*[-1, 0, 1, 2].choose(&mut rng).unwrap());
-    
-    for _ in 1..length {
-        if rng.gen::<f64>() < guide_ratio {
-            let prev = *symbols.last().unwrap();
-            symbols.push(pattern.predict_next(prev, &mut rng));
-        } else {
-            symbols.push(*[-1, 0, 1, 2].choose(&mut rng).unwrap());
+
+    THREAD_RNG.with(|rng_cell| {
+        let mut rng = rng_cell.borrow_mut();
+
+        symbols.push(*[-1, 0, 1, 2].choose(&mut *rng).unwrap());
+
+        for _ in 1..length {
+            if rng.gen::<f64>() < guide_ratio {
+                let prev = *symbols.last().unwrap();
+                symbols.push(pattern.predict_next(prev, &mut *rng));
+            } else {
+                symbols.push(*[-1, 0, 1, 2].choose(&mut *rng).unwrap());
+            }
         }
-    }
-    
+    });
+
     symbols
 }
 
@@ -246,14 +258,16 @@ fn entropy(symbols: &[i8]) -> f64 {
         counts[(s + 1) as usize] += 1;
     }
     let total = symbols.len() as f64;
-    counts
-        .iter()
-        .filter(|&&c| c > 0)
-        .map(|&c| {
-            let p = c as f64 / total;
-            -p * p.log2()
-        })
-        .sum()
+
+    // Inlined entropy calculation (remove iterator overhead)
+    let mut entropy = 0.0;
+    for &count in &counts {
+        if count > 0 {
+            let p = count as f64 / total;
+            entropy -= p * p.log2();
+        }
+    }
+    entropy
 }
 
 #[inline]
@@ -271,12 +285,19 @@ fn collapse_fast(symbols: &[i8]) -> BigUint {
 
 #[inline]
 fn is_obviously_composite(n: &BigUint) -> bool {
-    n.bit(0) == false  
-        || n % 3u32 == BigUint::zero()
-        || n % 5u32 == BigUint::zero()
-        || n % 7u32 == BigUint::zero()
-        || n % 11u32 == BigUint::zero()
-        || n % 13u32 == BigUint::zero()
+    // Quick even check (bit operation is fast)
+    if n.bit(0) == false {
+        return true;
+    }
+
+    // Batch check: n % (2*3*5*7*11*13) = n % 30030
+    // Then check if result is divisible by any small prime
+    let remainder = (n % 30030u32).to_u32().unwrap_or(0);
+    remainder % 3 == 0
+        || remainder % 5 == 0
+        || remainder % 7 == 0
+        || remainder % 11 == 0
+        || remainder % 13 == 0
 }
 
 #[inline]
@@ -316,25 +337,28 @@ fn is_prime_miller_rabin(n: &BigUint, rounds: u32) -> bool {
         r += 1;
     }
 
-    let mut rng = thread_rng();
-    
-    'witness: for _ in 0..rounds {
-        let a = rng.gen_biguint_range(&BigUint::from(2u32), &n_minus_1);
-        let mut x = a.modpow(&d, n);
-        
-        if x == BigUint::one() || x == n_minus_1 {
-            continue 'witness;
-        }
-        
-        for _ in 0..r-1 {
-            x = x.modpow(&BigUint::from(2u32), n);
-            if x == n_minus_1 {
+    // Use thread-local RNG instead of creating new one (optimization)
+    THREAD_RNG.with(|rng_cell| {
+        let mut rng = rng_cell.borrow_mut();
+
+        'witness: for _ in 0..rounds {
+            let a = rng.gen_biguint_range(&BigUint::from(2u32), &n_minus_1);
+            let mut x = a.modpow(&d, n);
+
+            if x == BigUint::one() || x == n_minus_1 {
                 continue 'witness;
             }
+
+            for _ in 0..r.saturating_sub(1) {
+                x = x.modpow(&BigUint::from(2u32), n);
+                if x == n_minus_1 {
+                    continue 'witness;
+                }
+            }
+            return false;
         }
-        return false;
-    }
-    true
+        true
+    })
 }
 
 // ============================================================================
