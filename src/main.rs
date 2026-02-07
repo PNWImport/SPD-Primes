@@ -581,7 +581,7 @@ fn main() {
     // =========================================================================
     // 🎯 CHANGE THIS LINE TO TARGET DIFFERENT DIGIT SIZES
     // =========================================================================
-    let config = Config::new(13300);  // Target: ~8,000 digits (Tier 3 hard target)
+    let config = Config::new(16600);  // Target: ~10,000 digits (R720 scaling test!)
     // =========================================================================
 
     // Only initialize DB for larger targets (8K+) to avoid overhead
