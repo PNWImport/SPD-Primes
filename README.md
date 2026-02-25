@@ -1,219 +1,276 @@
 # QuanJP Prime Hunter 2050 - ULTIMATE EDITION
 
-Machine Learning-Guided Prime Number Discovery using Rust & Rayon
+**Machine Learning-Guided Prime Number Discovery using Rust & Rayon**
 
-## 🎯 Project Overview
+A high-performance Rust application for discovering large probable primes (thousands to tens of thousands of digits) using ML-guided symbolic generation, multi-stage primality testing, and SQLite-backed historical learning.
 
-This project discovers large prime numbers (thousands to tens of thousands of digits) using:
+---
 
-- **Machine Learning**: Pattern matrix trained on known prime sequences
-- **Symbolic Generation**: 4-symbol alphabet (-1, 0, 1, 2) guided by learned patterns
-- **Multi-Stage Testing**: Entropy → Fermat → Miller-Rabin primality tests
-- **Parallel Processing**: Rayon-based parallelization across all CPU cores
+## 🎯 Quick Start
 
-## 🚀 Recent Discoveries
+```bash
+# Build with optimizations
+cargo build --release
 
-| Digits | File | Time | Attempts | Status |
-|--------|------|------|----------|--------|
-| **4,933** | `quanjp_ultimate_4933digits.txt` | 103.69s | 4,013 | ✅ Found |
-| **4,931** | `quanjp_ultimate_4931digits.txt` | 197.20s | 7,826 | ✅ Found |
-| **2,467** | `quanjp_ultimate_2467digits.txt` | 11.72s | 3,370 | ✅ Found |
-| **2,466** | `quanjp_ultimate_2466digits.txt` | 39.04s | 12,522 | ✅ Found |
+# Run prime hunter (configurable target in src/main.rs:511)
+./target/release/quanjp-prime-hunter
 
-## 📊 Performance Timeline
-
-```
-Baseline (25 M-R rounds):    39.04s for 2,466 digits
-Optimized M-R (15 rounds):   23.71s (39% faster)
-Optimized Fermat (2 bases):  11.72s (50% faster)
-Total Speedup:               70% improvement
+# Ingest historical results into database
+./target/release/ingest-history
 ```
 
-## 🔬 Algorithm Details
+---
 
-### 1. Pattern Matrix Learning
-- Loads training data from known primes
-- Creates 4×4 transition probability matrix
-- Learns which symbols follow which in prime sequences
+## 📊 Recent Discoveries
 
-### 2. Symbolic Sequence Generation
-- Random 4-symbol sequences (length configurable)
-- Guided by learned patterns (75% probability)
-- Generates candidate numbers via base-4 interpretation
+| Digits | Time | Attempts | Rate | Config | Status |
+|--------|------|----------|------|--------|--------|
+| **8,193** | 1,394.42s | 7,987 | 6/sec | 13609-seq | ✅ Found |
+| **4,000** | 52.73s | 2,455 | 63/sec | 6644-seq (15 cores) | ✅ Found |
+| **3,999** | 122.98s | 8,371 | 68/sec | 6644-seq (14 cores) | ✅ Found |
+| **4,933** | 103.69s | 4,013 | 39/sec | 8192-seq | ✅ Found |
+| **4,931** | 197.20s | 7,826 | 40/sec | 8192-seq | ✅ Found |
+| **2,467** | 11.72s | 3,370 | 288/sec | 4096-seq | ✅ Found |
+| **2,466** | 39.04s | 12,522 | 321/sec | 4096-seq | ✅ Found |
 
-### 3. Multi-Stage Primality Testing
+---
 
-**Stage 1: Quick Composite Filter**
-- Divisibility tests by 2, 3, 5, 7, 11, 13
-- Eliminates ~80% of candidates instantly
+## 🏗️ Project Structure
 
-**Stage 2: Fermat Test**
-- Tests with bases 2 and 3
-- Fermat's Little Theorem: a^(p-1) ≡ 1 (mod p)
-- Further filtering
+```
+SPD-Primes/
+├── src/
+│   ├── main.rs              # Main prime hunter algorithm
+│   └── bin/
+│       └── ingest_history.rs   # Historical data ingestion utility
+├── docs/                    # Documentation & guides
+├── results/                 # Discovered prime numbers
+├── verification/            # OpenPFGW verification files
+├── tools/                   # External utilities (pfgw binary)
+├── data/                    # SQLite database
+├── Cargo.toml              # Rust dependencies & config
+└── README.md               # This file
+```
 
-**Stage 3: Miller-Rabin Test**
-- 15 probabilistic rounds
-- Error rate: 2^-15 ≈ 0.003%
-- Primary determinant of primality
+---
 
-**Stage 4: Entropy Filtering**
-- Symbol entropy must exceed 1.88
+## 🧠 How It Works
+
+### 1. **ML-Guided Symbolic Generation**
+- Learns pattern matrix from known prime sequences
+- Uses 4-symbol alphabet: {-1, 0, 1, 2}
+- Generates candidates with 75% probability following learned patterns
+- 25% purely random for exploration
+
+### 2. **Multi-Stage Primality Testing**
+
+**Stage 1: Entropy Filter** (~100% pass)
+- Symbol entropy must exceed 1.88/2.0
 - Ensures candidate diversity
 
-## 🎛️ Configuration
+**Stage 2: Quick Composite Filter** (~80% elimination)
+- Divisibility tests: 2, 3, 5, 7, 11, 13
+- Instant rejection of obvious composites
+
+**Stage 3: Fermat Test** (~99% elimination)
+- Tests bases 2 and 3
+- Fermat's Little Theorem: a^(p-1) ≡ 1 (mod p)
+
+**Stage 4: Miller-Rabin Test** (final verdict)
+- 15 probabilistic rounds
+- Error rate: 2^-30 ≈ 99.9999% confidence
+- Determines primality
+
+### 3. **Historical Pattern Learning** (Optional for 8K+)
+- SQLite database tracks all discoveries
+- Lazy-loads patterns only for targets ≥ 8,000 digits
+- Avoids overhead on smaller searches
+- Improves candidate guidance for large primes
+
+---
+
+## ⚙️ Configuration
+
+Edit `src/main.rs` line 511 to change target digit size:
 
 ```rust
-Config::new(8192)  // Sequence length
-// Target: ~4,932 digits
-// Entropy threshold: 1.88
-// Miller-Rabin rounds: 15
-// Fermat bases: [2, 3]
-// Max attempts: 100,000
-// Pattern guidance: 75%
+let config = Config::new(6644);  // Target: ~4,000 digits
 ```
 
-### Quick Config Reference
+### Target Digit Reference Table
 
-| Target Digits | Sequence Length | Config |
+| Target Digits | Sequence Length | Expected Time (15 cores) |
 |---|---|---|
-| ~2,466 | 4,096 | `Config::new(4096)` |
-| ~4,932 | 8,192 | `Config::new(8192)` |
-| ~8,000 | 13,300 | `Config::new(13300)` |
+| ~2,466 | 4,096 | ~30-40s |
+| ~4,000 | 6,644 | ~50-100s |
+| ~4,932 | 8,192 | ~100-200s |
+| ~8,000 | 13,300 | ~30min+ |
 
-## 📝 Building & Running
+### Key Config Parameters (src/main.rs:400-432)
 
-### Build
+```rust
+struct Config {
+    sequence_len: usize,           // Symbol sequence length
+    entropy_threshold: f64,         // Min entropy: 1.88
+    primality_rounds: u32,          // Miller-Rabin: 15
+    max_attempts: u64,              // Search limit: 300,000
+    pattern_guide_ratio: f64,       // Learned pattern use: 75%
+    num_threads: usize,             // Auto-detect (CPU count - 1)
+}
+```
+
+---
+
+## 🔥 Performance Optimizations
+
+### Core Scaling Results (4K target)
+| Cores | Reservation | Duration | Winner |
+|-------|-------------|----------|--------|
+| **15** | 1 core | **52.73s** | ✅ **OPTIMAL** |
+| 14 | 2 cores | 122.98s | |
+| 16 | None | 187.47s | ❌ Contention |
+
+**Finding:** Reserving 1 core for OS is optimal. Full CPU allocation causes thread scheduling contention.
+
+### Database Integration
+- **Lazy loading:** Only initialize DB for targets ≥ 8K
+- **Smart pattern loading:** Load only sequences ±40% of target size
+- **Zero overhead for small targets:** Fast hardcoded defaults for 4-6K
+
+### Parallelization Strategy
+- **Rayon thread pool:** Distributes candidates across CPU cores
+- **Lock-free generation:** Each thread generates independently
+- **Atomic statistics:** Counters for pipeline stages
+- **Progress tracking:** Real-time attempt counter display
+
+---
+
+## 📚 Historical Database
+
+### Build Database from Results
+
+```bash
+cargo build --release --bin ingest-history
+./target/release/ingest-history
+```
+
+**Features:**
+- Ingests all result files from `results/` folder
+- Handles both old (no PhaseToken) and new (with PhaseToken) formats
+- Stores: timestamp, digit count, entropy, sequence, hashes
+- Supports legacy file formats with automatic timestamp generation
+
+### Database Schema
+
+```sql
+CREATE TABLE discoveries (
+    id INTEGER PRIMARY KEY,
+    timestamp INTEGER NOT NULL,
+    digits INTEGER NOT NULL,
+    entropy REAL NOT NULL,
+    sequence_length INTEGER NOT NULL,
+    symbols TEXT NOT NULL,        -- JSON array
+    session_hash TEXT NOT NULL,
+    result_hash TEXT NOT NULL
+);
+```
+
+---
+
+## 🔐 PhaseToken - Cryptographic Proof
+
+Each discovery includes a cryptographic PhaseToken:
+
+```
+PhaseToken
+==========
+Timestamp: 1770366581054
+Session Hash: 684aaaec5107a9ee5769dc3e19dc2ff5...
+Result Hash: ef514f0273d84940518549a91307662c...
+```
+
+**Components:**
+- **Timestamp:** UTC milliseconds of discovery
+- **Session Hash:** SHA3-512 of session ID + timestamp
+- **Result Hash:** SHA3-512 of the prime number
+
+This enables:
+- Reproducible discovery verification
+- Tamper-evident proof of generation
+- Audit trail for scientific validation
+
+---
+
+## 🛠️ Development
+
+### Build Release Binary
 ```bash
 cargo build --release
 ```
 
-### Run
+### Run Tests (if added)
 ```bash
-./target/release/quanjp-prime-hunter
+cargo test --release
 ```
 
-## 🔐 Verification with OpenPFGW
-
-Our discovered primes are ready for professional verification.
-
-### Quick Start
+### Profile Performance
 ```bash
-# Install OpenPFGW
-wget https://sourceforge.net/projects/openpfgw/files/pfgw-4.1.7_linux.7z
-7z x pfgw-4.1.7_linux.7z
-
-# Verify 4,931-digit prime
-./pfgw64 openpfgw_4931digits_input.txt -l"verify_4931.log"
-
-# Check results
-tail verify_4931.log
+time ./target/release/quanjp-prime-hunter
 ```
 
-### Expected Output
-```
-PRP (PROBABLE PRIME) ✓✓✓
-Confidence: 99.999999999...%
-```
-
-**See Also:**
-- `OPENPFGW_INSTRUCTIONS.md` - Detailed verification guide
-- `VALIDATION_GUIDE.md` - Complete validation workflow
-- `VERIFICATION_EXPECTED_OUTPUT.md` - What to expect
-- `TEMPLATE_verify_4931.log` - Example output format
-
-## 📚 Documentation Files
-
-| File | Purpose |
-|------|---------|
-| `main.rs` | Core algorithm implementation |
-| `Cargo.toml` | Rust dependencies & build config |
-| `README.md` | This file |
-| `OPENPFGW_INSTRUCTIONS.md` | How to use OpenPFGW for verification |
-| `VALIDATION_GUIDE.md` | Comprehensive validation guide |
-| `VERIFICATION_EXPECTED_OUTPUT.md` | What successful verification looks like |
-| `TEMPLATE_verify_4931.log` | Example verification log output |
-
-## 🎓 Algorithm Explanation
-
-### Why This Works
-
-1. **Prime Sequences Have Patterns**
-   - Real primes show non-random symbol distributions
-   - Our pattern matrix learns these subtle patterns
-   - Pattern-guided generation = better candidates
-
-2. **Multi-Stage Filtering is Efficient**
-   - Quick tests eliminate composites early
-   - Only strong candidates reach expensive Miller-Rabin
-   - Reduces computation by 99%+
-
-3. **Parallel Processing**
-   - Rayon spreads work across all cores
-   - Independent tests → perfect parallelization
-   - 15-thread scaling (16 cores - 1 for OS)
-
-### Entropy Significance
-- Higher entropy = more "prime-like" distribution
-- Our threshold (1.88) selects high-quality candidates
-- Reduces composite rate vs random generation
-
-## 🔗 Related Resources
-
-- **OpenPFGW**: https://sourceforge.net/projects/openpfgw/
-- **Prime Pages**: https://t5k.org
-- **GIMPS**: https://www.mersenne.org/
-- **gwnum Library**: https://www.mersenne.org/gwnums/
-
-## 📋 Optimization History
-
-1. ✅ Initial implementation (25 M-R rounds) - 39.04s
-2. ✅ Reduce M-R rounds to 15 (39% faster) - 23.71s
-3. ✅ Reduce Fermat bases from 3 to 2 (50% faster) - 11.72s
-4. ✅ Test larger targets (8192 sequence) - 4,931 digits in 103.69s
-
-## 🚀 Future Optimizations
-
-- [ ] Adaptive entropy thresholds
-- [ ] Lucas-Lehmer for special forms
-- [ ] GPU acceleration (NVIDIA CUDA)
-- [ ] Distributed computing (multiple systems)
-- [ ] Specialized tests for Mersenne-like forms
-- [ ] Prime certificate generation for ECPP
-
-## 📄 License
-
-This project demonstrates ML-guided prime discovery techniques.
-
-## 👤 Discovery Information
-
-**Project**: QuanJP Prime Hunter 2050
-**Edition**: ULTIMATE
-**Latest Update**: 2026-01-23
-**Optimization**: 70% performance improvement achieved
-**Hardware**: 16-core processor (15 threads utilized)
-
-## 🎯 Getting Started
-
-1. **Clone and build**
-   ```bash
-   cargo build --release
-   ```
-
-2. **Run prime discovery**
-   ```bash
-   ./target/release/quanjp-prime-hunter
-   ```
-
-3. **Verify result**
-   - Output file: `quanjp_ultimate_XXXXX_digits.txt`
-   - Use OpenPFGW for official verification
-
-4. **(Optional) Submit to Prime Pages**
-   - Get OpenPFGW certificate
-   - Visit https://t5k.org/submit/
-   - Include discovery method and credentials
+### Dependencies
+- **rand** - Random number generation
+- **rayon** - Data parallelization
+- **num-bigint** - Arbitrary precision integers
+- **rusqlite** - SQLite database (bundled)
+- **indicatif** - Progress bars
+- **colored** - Terminal colors
+- **serde/serde_json** - Serialization
+- **sha3** - Cryptographic hashing
+- **chrono** - Timestamp handling
 
 ---
 
-**Status**: ✅ Ready for official verification and Prime Pages submission
+## 📖 Understanding Primality Testing
+
+### Miller-Rabin Test (Probabilistic)
+- Tests if number n is probably prime
+- Each round: 2^-2 = 75% accuracy per round
+- 15 rounds: (0.75)^15 ≈ 99.9999% confidence
+- Much faster than deterministic tests on large numbers
+
+### Why Probable Prime?
+- True proof requires sophisticated algorithms (ECPP, AKS)
+- Probable primes sufficient for cryptographic/research use
+- T5K Prime Pages accept Miller-Rabin with proper documentation
+
+---
+
+## 🔗 Related Resources
+
+- **Prime Pages (T5K):** https://primes.utm.edu/top20/ - Prime number records
+- **OpenPFGW:** Prime verification tool (included in `tools/`)
+- **Miller-Rabin:** https://en.wikipedia.org/wiki/Miller%E2%80%93Rabin_primality_test
+
+---
+
+## 📝 License
+
+[Project license TBD]
+
+---
+
+## 🚀 Future Work
+
+- [ ] ECPP verification for proven primes
+- [ ] Larger digit targets (16K+)
+- [ ] Optimized entropy threshold tuning
+- [ ] GPU acceleration for Miller-Rabin
+- [ ] Web interface for monitoring
+- [ ] Distributed search across machines
+
+---
+
+**Last Updated:** February 2025
+**Current Status:** Active Development
+**Best Configuration:** 15 cores, 4K-6K digit targets for speed
