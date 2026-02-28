@@ -647,7 +647,7 @@ fn main() {
     // =========================================================================
     // 🎯 CHANGE THIS LINE TO TARGET DIFFERENT DIGIT SIZES
     // =========================================================================
-    let config = Config::new(8192);   // Target: ~4,932 digits
+    let config = Config::new(16700);  // Target: ~10,053 digits
     // =========================================================================
 
     // Only initialize DB for larger targets (8K+) to avoid overhead
