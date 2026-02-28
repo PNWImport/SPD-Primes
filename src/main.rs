@@ -520,8 +520,46 @@ fn is_prime_miller_rabin(n: &Integer, rounds: u32) -> bool {
 // TRAINING DATA LOADING
 // ============================================================================
 
+/// Parse symbols from any quanjp_*.txt prime file (the "Symbols:" section).
+fn load_symbols_from_txt_files() -> Vec<Vec<i8>> {
+    let mut results = Vec::new();
+    let dir = std::path::Path::new(".");
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        let mut paths: Vec<_> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension().and_then(|s| s.to_str()) == Some("txt")
+                    && p.file_name()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.starts_with("quanjp_"))
+                        .unwrap_or(false)
+            })
+            .collect();
+        paths.sort(); // deterministic order
+        for path in paths {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                let mut after_symbols = false;
+                for line in content.lines() {
+                    if line.trim() == "Symbols:" {
+                        after_symbols = true;
+                        continue;
+                    }
+                    if after_symbols && line.starts_with('[') {
+                        if let Ok(syms) = serde_json::from_str::<Vec<i8>>(line.trim()) {
+                            results.push(syms);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    results
+}
+
 fn load_training_data() -> Vec<Vec<i8>> {
-    let mut training_data = Vec::new();
+    let mut training_data = load_symbols_from_txt_files();
 
     if let Ok(data) = std::fs::read_to_string("prime_1233_symbols.json") {
         if let Ok(symbols) = serde_json::from_str::<Vec<i8>>(&data) {
@@ -555,6 +593,14 @@ fn load_training_data_with_history(conn: &Connection, target_digits: usize) -> V
             println!("   ✓ Loaded {} historical sequences from database", training_data.len());
             return training_data;
         }
+    }
+
+    // Fallback: txt files from previous runs
+    let txt_symbols = load_symbols_from_txt_files();
+    if !txt_symbols.is_empty() {
+        println!("   ✓ Loaded {} sequences from .txt prime files", txt_symbols.len());
+        training_data.extend(txt_symbols);
+        return training_data;
     }
 
     // Fallback to JSON files
@@ -645,148 +691,160 @@ fn main() {
     println!("   ⑥ Full GMP Integer collapse (now rare!)");
     println!("   ⑦ Miller-Rabin (bases 2,3,5 + {} random witnesses)", config.primality_rounds.saturating_sub(3));
 
-    println!("\n{}", "🚀 Starting Prime Hunt...".bright_green().bold());
+    println!("\n{}", "🚀 Starting Prime Hunt — TARGET: 10 PRIMES".bright_green().bold());
 
-    let stats = Statistics::new();
+    let target_count = 10usize;
+    let mut primes_found = 0usize;
+    let mut total_attempts: u64 = 0;
+    let hunt_start = Instant::now();
 
-    let pb = ProgressBar::new(config.max_attempts);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] {pos}/{len} attempts | {per_sec} | ETA {eta} {msg}")
-            .unwrap()
-            .progress_chars("█▓▒░ "),
-    );
+    while primes_found < target_count {
+        println!(
+            "\n{}",
+            format!("🔍 Hunt {}/{} ...", primes_found + 1, target_count)
+                .bright_cyan()
+                .bold()
+        );
 
-    let now = Instant::now();
+        let stats = Statistics::new();
 
-    let result = (0..config.max_attempts).into_par_iter().find_map_any(|_| {
-        let attempt = stats.attempts.fetch_add(1, Ordering::Relaxed);
+        let pb = ProgressBar::new(config.max_attempts);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] {pos}/{len} attempts | {per_sec} | ETA {eta} {msg}")
+                .unwrap()
+                .progress_chars("█▓▒░ "),
+        );
 
-        if attempt % 100 == 0 {
-            pb.set_position(attempt);
-            // Live rate: elapsed / attempts gives current throughput
-            let secs = now.elapsed().as_secs_f64();
-            if secs > 0.0 {
-                let rate = attempt as f64 / secs;
-                pb.set_message(format!("({:.0} att/s)", rate));
-            }
-        }
+        let now = Instant::now();
 
-        // =====================================================================
-        // STAGE 0: Symbolic generation
-        // =====================================================================
-        let symbols = generate_symbolic_guided(config.sequence_len, &pattern_matrix, config.pattern_guide_ratio);
+        // Snapshot pattern matrix for this parallel round
+        let pm_snap = pattern_matrix.clone();
 
-        // =====================================================================
-        // STAGE 0.5: Oddness gate — 1 comparison, eliminates ~50%
-        // =====================================================================
-        if !is_symbolically_odd(&symbols) {
-            return None;
-        }
+        let result = (0..config.max_attempts).into_par_iter().find_map_any(|_| {
+            let attempt = stats.attempts.fetch_add(1, Ordering::Relaxed);
 
-        // =====================================================================
-        // STAGE 1: Symbolic score gate (O(n) int ops only)
-        // =====================================================================
-        let score = symbolic_score(&symbols, &pattern_matrix);
-        if score < config.symbolic_score_threshold {
-            return None;
-        }
-        stats.symbolic_score_passed.fetch_add(1, Ordering::Relaxed);
-
-        // =====================================================================
-        // STAGE 2: Symbolic residue filters — mod {3,5,7,11,13,17,19,23}
-        // =====================================================================
-        let residues = symbolic_residues(&symbols);
-
-        // Reject if divisible by any small prime (residue = 0)
-        if residues.iter().any(|&r| r == 0) {
-            return None;
-        }
-        stats.symbolic_residue_passed.fetch_add(1, Ordering::Relaxed);
-
-
-        // =====================================================================
-        // STAGE 4: Partial collapse check (cheap)
-        // =====================================================================
-        if !partial_collapse_check(&symbols) {
-            return None;
-        }
-        stats.partial_collapse_passed.fetch_add(1, Ordering::Relaxed);
-
-        // =====================================================================
-        // STAGE 5: Full collapse (now very rare!)
-        // =====================================================================
-        let n = collapse_fast(&symbols);
-        stats.full_collapse_passed.fetch_add(1, Ordering::Relaxed);
-
-        // =====================================================================
-        // STAGE 6: Miller-Rabin verification
-        // =====================================================================
-        if is_prime_miller_rabin(&n, config.primality_rounds) {
-            stats.miller_rabin_passed.fetch_add(1, Ordering::Relaxed);
-            let ent = {
-                let mut counts = [0usize; 4];
-                for &s in &symbols { counts[(s + 1) as usize] += 1; }
-                let total = symbols.len() as f64;
-                counts.iter().filter(|&&c| c > 0)
-                    .map(|&c| { let p = c as f64 / total; -p * p.log2() })
-                    .sum::<f64>()
-            };
-            Some((n, ent, symbols))
-        } else {
-            None
-        }
-    });
-
-    pb.finish_and_clear();
-    let duration = now.elapsed();
-
-    match result {
-        Some((prime, ent, symbols)) => {
-            let prime_str = prime.to_string_radix(10);
-            let digits = prime_str.len();
-
-            println!("\n{}", "✅ 🎉 PRIME DISCOVERED!".bright_green().bold());
-            println!("\n   Digits:      {}", digits.to_string().bright_white().bold());
-            println!("   Entropy:     {:.6}", ent);
-            println!("   Sequence:    {}", symbols.len());
-
-            // Generate PhaseToken for cryptographic proof
-            let session_id = format!("QuanJP-Symbolic-{}-{}", digits, Utc::now().format("%Y%m%d"));
-            let token = PhaseToken::new(&session_id, &prime);
-            token.display();
-
-            // Save discovery to database (if available)
-            if let Some(ref connection) = db {
-                if let Err(e) = save_discovery(connection, token.timestamp, digits, ent, symbols.len(), &symbols, &token.session_hash, &token.result_hash) {
-                    println!("   ⚠️  Warning: Failed to save to database: {}", e);
-                } else {
-                    println!("   ✓ Saved to database");
+            if attempt % 100 == 0 {
+                pb.set_position(attempt);
+                let secs = now.elapsed().as_secs_f64();
+                if secs > 0.0 {
+                    pb.set_message(format!("({:.0} att/s)", attempt as f64 / secs));
                 }
             }
 
-            stats.print_summary(duration);
+            let symbols = generate_symbolic_guided(config.sequence_len, &pm_snap, config.pattern_guide_ratio);
 
-            let filename = format!("quanjp_ultimate_{}digits.txt", digits);
-            std::fs::write(&filename, format!(
-                "QuanJP Ultimate Prime\n\
-                 ====================\n\
-                 Digits: {}\n\
-                 Entropy: {:.6}\n\
-                 Sequence Length: {}\n\
-                 \n\
-                 {}\n\
-                 Prime:\n{}\n\
-                 \n\
-                 Symbols:\n{:?}\n",
-                digits, ent, symbols.len(), token.to_string_full(), prime_str, symbols
-            )).ok();
+            if !is_symbolically_odd(&symbols) { return None; }
 
-            println!("\n{} Saved to {}", "💾".bright_green(), filename);
-        }
-        None => {
-            println!("\n❌ No prime found in {} attempts", config.max_attempts);
-            stats.print_summary(duration);
+            let score = symbolic_score(&symbols, &pm_snap);
+            if score < config.symbolic_score_threshold { return None; }
+            stats.symbolic_score_passed.fetch_add(1, Ordering::Relaxed);
+
+            let residues = symbolic_residues(&symbols);
+            if residues.iter().any(|&r| r == 0) { return None; }
+            stats.symbolic_residue_passed.fetch_add(1, Ordering::Relaxed);
+
+            if !partial_collapse_check(&symbols) { return None; }
+            stats.partial_collapse_passed.fetch_add(1, Ordering::Relaxed);
+
+            let n = collapse_fast(&symbols);
+            stats.full_collapse_passed.fetch_add(1, Ordering::Relaxed);
+
+            if is_prime_miller_rabin(&n, config.primality_rounds) {
+                stats.miller_rabin_passed.fetch_add(1, Ordering::Relaxed);
+                let ent = {
+                    let mut counts = [0usize; 4];
+                    for &s in &symbols { counts[(s + 1) as usize] += 1; }
+                    let total = symbols.len() as f64;
+                    counts.iter().filter(|&&c| c > 0)
+                        .map(|&c| { let p = c as f64 / total; -p * p.log2() })
+                        .sum::<f64>()
+                };
+                Some((n, ent, symbols))
+            } else {
+                None
+            }
+        });
+
+        pb.finish_and_clear();
+        let round_duration = now.elapsed();
+        total_attempts += stats.attempts.load(Ordering::Relaxed);
+
+        match result {
+            Some((prime, ent, symbols)) => {
+                primes_found += 1;
+
+                let prime_str = prime.to_string_radix(10);
+                let digits = prime_str.len();
+
+                println!(
+                    "\n{}",
+                    format!("✅ 🎉 PRIME #{} DISCOVERED!", primes_found)
+                        .bright_green()
+                        .bold()
+                );
+                println!("\n   Digits:      {}", digits.to_string().bright_white().bold());
+                println!("   Entropy:     {:.6}", ent);
+                println!("   Sequence:    {}", symbols.len());
+
+                let session_id = format!(
+                    "QuanJP-Symbolic-{}-{}-#{:02}",
+                    digits,
+                    Utc::now().format("%Y%m%d"),
+                    primes_found
+                );
+                let token = PhaseToken::new(&session_id, &prime);
+                token.display();
+
+                if let Some(ref connection) = db {
+                    if let Err(e) = save_discovery(
+                        connection, token.timestamp, digits, ent,
+                        symbols.len(), &symbols, &token.session_hash, &token.result_hash,
+                    ) {
+                        println!("   ⚠️  Warning: Failed to save to database: {}", e);
+                    } else {
+                        println!("   ✓ Saved to database");
+                    }
+                }
+
+                stats.print_summary(round_duration);
+
+                let filename = format!("quanjp_prime_{:02}_{digits}digits.txt", primes_found);
+                std::fs::write(&filename, format!(
+                    "QuanJP Ultimate Prime #{:02}\n\
+                     ====================\n\
+                     Digits: {}\n\
+                     Entropy: {:.6}\n\
+                     Sequence Length: {}\n\
+                     \n\
+                     {}\n\
+                     Prime:\n{}\n\
+                     \n\
+                     Symbols:\n{:?}\n",
+                    primes_found, digits, ent, symbols.len(),
+                    token.to_string_full(), prime_str, symbols
+                )).ok();
+
+                println!("\n{} Saved to {}", "💾".bright_green(), filename);
+
+                // Feed this prime's symbol pattern back so future hunts benefit
+                pattern_matrix.learn_from_sequence(&symbols);
+            }
+            None => {
+                println!(
+                    "   ⚠️  Round exhausted ({} attempts) — retrying...",
+                    stats.attempts.load(Ordering::Relaxed)
+                );
+            }
         }
     }
+
+    let total_elapsed = hunt_start.elapsed();
+    println!("\n{}", "🏆 ALL 10 PRIMES FOUND!".bright_green().bold());
+    println!("   Total wall time : {:.2?}", total_elapsed);
+    println!("   Total attempts  : {}", total_attempts);
+    println!(
+        "   Avg per prime   : {:.2?}",
+        total_elapsed / target_count as u32
+    );
 }
