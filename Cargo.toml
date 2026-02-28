@@ -30,6 +30,10 @@ path = "src/bin/ingest_history.rs"
 name = "multi-search"
 path = "src/bin/multi_search.rs"
 
+[[bin]]
+name = "batch-stats"
+path = "src/bin/batch_stats.rs"
+
 [profile.release]
 opt-level = 3
 lto = "fat"
