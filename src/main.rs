@@ -1,7 +1,6 @@
 use rand::prelude::*;
 use rayon::prelude::*;
-use num_bigint::{BigUint, RandBigInt};
-use num_traits::{Zero, One};
+use rug::{Integer, rand::RandState};
 use std::time::Instant;
 use std::sync::atomic::{AtomicU64, Ordering};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -19,6 +18,17 @@ use std::cell::RefCell;
 
 thread_local! {
     static THREAD_RNG: RefCell<ThreadRng> = RefCell::new(thread_rng());
+
+    // Per-thread GMP RandState for rug witness generation — seeded once per thread
+    static MR_RAND: RefCell<RandState<'static>> = {
+        let mut rs = RandState::new();
+        let seed_u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0xdeadbeef);
+        rs.seed(&Integer::from(seed_u64));
+        RefCell::new(rs)
+    };
 }
 
 // ============================================================================
@@ -108,7 +118,7 @@ struct PhaseToken {
 }
 
 impl PhaseToken {
-    fn new(session_id: &str, result: &BigUint) -> Self {
+    fn new(session_id: &str, result: &Integer) -> Self {
         let timestamp = Utc::now().timestamp_millis();
 
         let mut hasher = Sha3_512::new();
@@ -116,7 +126,7 @@ impl PhaseToken {
         hasher.update(timestamp.to_be_bytes());
         let session_hash = format!("{:x}", hasher.finalize_reset());
 
-        hasher.update(result.to_bytes_be());
+        hasher.update(result.to_string_radix(10).as_bytes());
         let result_hash = format!("{:x}", hasher.finalize());
 
         PhaseToken { timestamp, session_hash, result_hash }
@@ -213,10 +223,10 @@ impl PatternMatrix {
 // ============================================================================
 
 lazy_static! {
-    static ref POWER_CACHE: Vec<BigUint> = {
+    static ref POWER_CACHE: Vec<Integer> = {
         let mut cache = Vec::with_capacity(200000);
-        let four = BigUint::from(4u32);
-        let mut power = BigUint::one();
+        let four = Integer::from(4u32);
+        let mut power = Integer::from(1u32);
 
         for _ in 0..200000 {
             cache.push(power.clone());
@@ -431,13 +441,15 @@ fn partial_collapse_check(symbols: &[i8]) -> bool {
 // ============================================================================
 
 #[inline]
-fn collapse_fast(symbols: &[i8]) -> BigUint {
-    let mut result = BigUint::zero();
+fn collapse_fast(symbols: &[i8]) -> Integer {
+    let mut result = Integer::new();
 
     for (i, &s) in symbols.iter().enumerate() {
         let val = if s == -1 { 3u32 } else { s as u32 };
         if val > 0 {
-            result += BigUint::from(val) * &POWER_CACHE[i];
+            let mut term = POWER_CACHE[i].clone();
+            term *= val;
+            result += term;
         }
     }
     result
@@ -447,64 +459,61 @@ fn collapse_fast(symbols: &[i8]) -> BigUint {
 // STAGE 6: VERIFICATION (Miller-Rabin)
 // ============================================================================
 
-/// Miller-Rabin with deterministic small bases first.
-/// Bases 2, 3, 5 catch most composites immediately — no RNG overhead,
-/// no BigUint random generation. Remaining rounds use random witnesses.
+/// Single Miller-Rabin witness check — returns true if `a` does NOT witness compositeness.
 #[inline]
-fn is_prime_miller_rabin(n: &BigUint, rounds: u32) -> bool {
-    if n < &BigUint::from(2u32) {
-        return false;
+fn mr_witness_passes(a: &Integer, d: &Integer, r: u32, n: &Integer, n_minus_1: &Integer) -> bool {
+    if a >= n_minus_1 { return true; }
+    let mut x = a.clone().pow_mod(d, n).unwrap();
+    if x == 1u32 || x == *n_minus_1 { return true; }
+    for _ in 0..r.saturating_sub(1) {
+        x = x.pow_mod(&Integer::from(2u32), n).unwrap();
+        if x == *n_minus_1 { return true; }
     }
-    if n == &BigUint::from(2u32) || n == &BigUint::from(3u32) {
-        return true;
-    }
-    if !n.bit(0) {
-        return false;
-    }
+    false
+}
 
-    let n_minus_1 = n - BigUint::one();
+/// Miller-Rabin with GMP modpow + parallel witness checks via Rayon.
+/// Deterministic bases 2, 3, 5 first; remaining rounds use per-thread GMP RandState.
+/// All witnesses collected upfront, then checked with par_iter().all() — short-circuits
+/// on first composite witness, but Rayon can schedule idle workers on the others.
+fn is_prime_miller_rabin(n: &Integer, rounds: u32) -> bool {
+    if *n < 2u32 { return false; }
+    if *n == 2u32 || *n == 3u32 { return true; }
+    if n.is_even() { return false; }
+
+    let mut n_minus_1 = n.clone();
+    n_minus_1 -= 1u32;
+
     let mut d = n_minus_1.clone();
     let mut r = 0u32;
-    while !d.bit(0) {
+    while d.is_even() {
         d >>= 1;
         r += 1;
     }
 
-    // Phase 1: deterministic bases (no RNG cost, catches most composites)
-    let det_bases: [u32; 3] = [2, 3, 5];
-    let det_count = det_bases.len().min(rounds as usize);
-    for &base in &det_bases[..det_count] {
-        let a = BigUint::from(base);
-        if &a >= &n_minus_1 { continue; }
-        let mut x = a.modpow(&d, n);
-        if x == BigUint::one() || x == n_minus_1 { continue; }
-        let mut composite = true;
-        for _ in 0..r.saturating_sub(1) {
-            x = x.modpow(&BigUint::from(2u32), n);
-            if x == n_minus_1 { composite = false; break; }
-        }
-        if composite { return false; }
+    // Collect all witnesses upfront
+    let det_count = (rounds as usize).min(3);
+    let mut witnesses: Vec<Integer> = [2u32, 3u32, 5u32][..det_count]
+        .iter().map(|&b| Integer::from(b)).collect();
+
+    let random_rounds = rounds.saturating_sub(det_count as u32);
+    if random_rounds > 0 {
+        MR_RAND.with(|rs_cell| {
+            let mut rs = rs_cell.borrow_mut();
+            let range = {
+                let mut r = n_minus_1.clone();
+                r -= 2u32;
+                r
+            };
+            for _ in 0..random_rounds {
+                let a = range.clone().random_below(&mut *rs) + 2u32;
+                witnesses.push(a);
+            }
+        });
     }
 
-    // Phase 2: random witnesses for remaining rounds
-    let random_rounds = rounds.saturating_sub(det_count as u32);
-    if random_rounds == 0 { return true; }
-    THREAD_RNG.with(|rng_cell| {
-        let mut rng = rng_cell.borrow_mut();
-
-        for _ in 0..random_rounds {
-            let a = rng.gen_biguint_range(&BigUint::from(2u32), &n_minus_1);
-            let mut x = a.modpow(&d, n);
-            if x == BigUint::one() || x == n_minus_1 { continue; }
-            let mut composite = true;
-            for _ in 0..r.saturating_sub(1) {
-                x = x.modpow(&BigUint::from(2u32), n);
-                if x == n_minus_1 { composite = false; break; }
-            }
-            if composite { return false; }
-        }
-        true
-    })
+    // Check all witnesses in parallel — par_iter().all() short-circuits on false
+    witnesses.par_iter().all(|a| mr_witness_passes(a, &d, r, n, &n_minus_1))
 }
 
 // ============================================================================
@@ -633,7 +642,7 @@ fn main() {
     println!("   ③ Symbolic score gate (rejects ~60% of odd candidates)");
     println!("   ④ Symbolic residue filters mod {{3,5,7,11,13,17,19,23}}");
     println!("   ⑤ Partial collapse checks");
-    println!("   ⑥ Full BigUint collapse (now rare!)");
+    println!("   ⑥ Full GMP Integer collapse (now rare!)");
     println!("   ⑦ Miller-Rabin (bases 2,3,5 + {} random witnesses)", config.primality_rounds.saturating_sub(3));
 
     println!("\n{}", "🚀 Starting Prime Hunt...".bright_green().bold());
@@ -734,7 +743,8 @@ fn main() {
 
     match result {
         Some((prime, ent, symbols)) => {
-            let digits = prime.to_str_radix(10).len();
+            let prime_str = prime.to_string_radix(10);
+            let digits = prime_str.len();
 
             println!("\n{}", "✅ 🎉 PRIME DISCOVERED!".bright_green().bold());
             println!("\n   Digits:      {}", digits.to_string().bright_white().bold());
@@ -758,7 +768,6 @@ fn main() {
             stats.print_summary(duration);
 
             let filename = format!("quanjp_ultimate_{}digits.txt", digits);
-            let prime_str = prime.to_str_radix(10);
             std::fs::write(&filename, format!(
                 "QuanJP Ultimate Prime\n\
                  ====================\n\
