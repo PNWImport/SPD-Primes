@@ -1,102 +1,91 @@
 # Getting Started with QuanJP Prime Hunter
 
-## Installation
+## Prerequisites
 
-### Prerequisites
 - Rust 1.70+ ([install here](https://rustup.rs/))
-- Linux/macOS/Windows with gcc/clang
-- 16GB+ RAM recommended
-- Multi-core CPU (16+ cores optimal)
+- Linux with gcc/clang (GMP via `rug` crate)
+- 8GB+ RAM (16GB+ recommended for 10K+ digit targets)
+- Multi-core CPU (16 cores optimal)
 
-### Clone & Build
+## Clone & Build
 
 ```bash
 git clone https://github.com/PNWImport/SPD-Primes.git
 cd SPD-Primes
 
-# Build optimized binary
 cargo build --release
-
-# Binary location
-./target/release/quanjp-prime-hunter
 ```
+
+Binaries:
+- `./target/release/quanjp-prime-hunter` — prime discovery
+- `./target/release/ingest-history` — populate the learning database
 
 ---
 
 ## Quick Run
 
-### Run with Default Configuration (4K target)
-
 ```bash
-# Just run it!
 ./target/release/quanjp-prime-hunter
 ```
 
 **What happens:**
-1. Detects 16 CPUs, uses 15 threads
-2. Loads training patterns (hardcoded defaults)
-3. Starts searching for ~4,000 digit prime
-4. Expected time: 50-100 seconds
-5. Saves result to `quanjp_ultimate_XXXX_digits.txt`
+1. Detects 16 CPUs, uses all 16 threads
+2. Loads training patterns from `data/prime_history.db` (if available)
+3. Searches for a ~10,053-digit prime (sequence length 16,700)
+4. Saves result to `results/quanjp_prime_NN_XXXXXdigits.txt`
 
-### Expected Output
+**Expected output:**
 
 ```
-🚀 QuanJP Prime Hunter 2050 - ULTIMATE EDITION
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🚀 QuanJP Prime Hunter 2050 - SYMBOLIC-FIRST EDITION
+   ⚡ Tier 3: Symbolic exploration + numeric verification
 
 💻 System Detection:
    Physical CPUs:  16
    Logical CPUs:   16
-   Using threads:  15 (CPU - 1 for OS)
+   Using threads:  16 (all cores)
 
 🧠 Loading & Learning Patterns...
-   ✅ Learned from sequence 1 (16 symbols)
-   ✅ Learned from sequence 2 (16 symbols)
+   ✓ Loaded 4 historical sequences from database
 
 ⚙️  Configuration:
-   Sequence length:        6644
-   Target digits:          ~4000
-   ...
+   Sequence length:        16700
+   Target digits:          ~10054
+   Symbolic score gate:    > 0.24
+   Miller-Rabin rounds:    15
+   Max attempts:           300000
+   Pattern guidance:       75%
 
-🚀 Starting Prime Hunt...
+🔍 Hunt 1/10 ...
 
 ✅ 🎉 PRIME DISCOVERED!
-   Digits:      3999
-   Entropy:     1.913272
-   ...
-   Duration:              52.73s
-   Rate:                  63 attempts/sec
+   Digits:      10055
+   Duration:    213.37s
+   Attempts:    6,764
 
-💾 Saved to quanjp_ultimate_3999digits.txt
+💾 Saved to results/quanjp_prime_01_10055digits.txt
 ```
 
 ---
 
 ## Changing Target Digit Size
 
-Edit `src/main.rs` line 511:
+Edit `src/main.rs` line 646:
 
 ```rust
-let config = Config::new(6644);  // Target: ~4,000 digits
+let config = Config::new(16700);  // ~10,053 digits
 ```
 
 ### Common Targets
 
 ```rust
-// Small (fast)
-Config::new(4096)    // ~2,466 digits, ~20-40s
-
-// Medium (balanced)
-Config::new(6644)    // ~4,000 digits, ~50-100s
-Config::new(8192)    // ~4,932 digits, ~100-200s
-
-// Large (slow, needs DB learning)
-Config::new(13300)   // ~8,000 digits, 30+ minutes
-Config::new(13609)   // ~8,193 digits, 20+ minutes
+Config::new(4096)    // ~2,466 digits  — ~20–40s
+Config::new(8192)    // ~4,932 digits  — ~100–200s
+Config::new(13300)   // ~8,000 digits  — 8–15 min
+Config::new(16700)   // ~10,053 digits — 3–20 min  ← default
 ```
 
-Then rebuild:
+Then rebuild and run:
 
 ```bash
 cargo build --release
@@ -105,11 +94,9 @@ cargo build --release
 
 ---
 
-## Using Historical Database
+## Building the Learning Database
 
-### Ingest Previous Results
-
-After running multiple searches, populate the database:
+The database lets each run learn from all previous discoveries.
 
 ```bash
 cargo build --release --bin ingest-history
@@ -117,172 +104,127 @@ cargo build --release --bin ingest-history
 ```
 
 **Output:**
+
 ```
-Processing: results/quanjp_ultimate_2466digits.txt
-  ✓ Saved 2466-digit prime
-Processing: results/quanjp_ultimate_4931digits.txt
-  ✓ Saved 4931-digit prime
+Processing: results/quanjp_ultimate_9994digits.txt
+  ✓ Saved 9994-digit prime
+Processing: results/quanjp_prime_01_10055digits.txt
+  ✓ Saved 10055-digit prime
 ...
-✅ Ingestion complete! Processed 8 discoveries
-Database now contains 8 total discoveries:
-  Digit sizes: 2466,2467,3999,4000,4095,4931,4933,8193
+✅ Ingestion complete! 28 total discoveries in database.
 ```
 
-### How Database Helps
-
-For targets ≥ 8,000 digits:
-- Database loads historically successful sequences
-- Uses proven patterns to guide candidate generation
-- Slightly slower startup (~1-2 seconds overhead)
-- Better pattern quality → fewer attempts needed
-
-For targets < 8,000 digits:
-- Database skipped automatically
-- Uses fast hardcoded defaults
-- No overhead, maximum speed
+The database activates automatically for targets ≥ 8,000 digits. Below that the overhead
+isn't worth it — hardcoded defaults are used instead.
 
 ---
 
-## Monitoring a Long Run
-
-### Background Execution
+## Running in the Background
 
 ```bash
-# Run in background
+# Run 10 hunts, log to file
 nohup ./target/release/quanjp-prime-hunter > prime_hunt.log 2>&1 &
 
-# Monitor progress
+# Watch progress
 tail -f prime_hunt.log
 
 # Check process
-ps aux | grep quanjp
-```
-
-### Parallelization Details
-
-**Current Configuration (src/main.rs:417-432):**
-- Physical cores detected: 16
-- Threads allocated: 15 (1 reserved for OS)
-- Parallel search: Independent per thread
-- Lock-free generation: No contention
-- Atomic counters: Thread-safe statistics
-
-**To adjust threads:**
-Edit `Config::new()` in `src/main.rs`:
-```rust
-let num_threads = if physical_cpus > 1 {
-    physical_cpus - 1  // Adjust this
-} else {
-    1
-};
+pgrep -a quanjp
 ```
 
 ---
 
-## Understanding Results
-
-### Result File Format
+## Understanding the Result Files
 
 ```
-QuanJP Ultimate Prime
+QuanJP Ultimate Prime #01
 ====================
-Digits: 3999
-Entropy: 1.913272
-Sequence Length: 6644
+Digits: 10055
+Entropy: 1.991835
+Sequence Length: 16700
 
 PhaseToken
 ==========
-Timestamp: 1770366581054
-Session Hash: 684aaaec5107a9ee5769dc3e19dc2ff5...
-Result Hash: ef514f0273d84940518549a91307662c...
+Timestamp: 1772305980122
+Session Hash: f15579952dd83646...
+Result Hash:  5dad8415119f2d78...
 
 Prime:
-[8,000+ digit number...]
+190152113551574791893781...  (10,055 digits)
 
 Symbols:
-[-1, 0, 1, 2, -1, 1, 0, ...] (6644 symbols)
+[-1, 0, 1, 2, -1, 1, 0, ...]  (16,700 symbols)
 ```
 
-**What each field means:**
+| Field | Meaning |
+|-------|---------|
+| Digits | Confirmed decimal digit count |
+| Entropy | Shannon entropy of symbolic sequence (1.88–2.0 range) |
+| Sequence Length | Number of symbols (controls target digit size) |
+| PhaseToken | Cryptographic proof of discovery |
+| Prime | The prime number in base 10 |
+| Symbols | The -1/0/1/2 sequence that generated it |
 
-- **Digits:** Confirmed decimal digit count of prime
-- **Entropy:** Shannon entropy of symbolic sequence (1.88-2.0 range)
-- **Sequence Length:** Number of symbols used (determines digit size)
-- **PhaseToken:** Cryptographic proof of discovery
-- **Prime:** The actual prime number (base 10)
-- **Symbols:** The -1/0/1/2 sequence that generated it
+---
 
-### Verifying a Prime
-
-With OpenPFGW (included):
+## Verifying a Prime
 
 ```bash
-cd tools
-7z x pfgw64-4.1.7_linux.7z
-cd ..
-
-# Create input file
-echo "ABC [base10:../results/quanjp_ultimate_3999digits.txt]" > verify.txt
+# Extract pfgw
+cd tools && 7z x pfgw64-4.1.7_linux.7z && cd ..
 
 # Run verification
-./tools/pfgw64 -f verify.txt
+./tools/pfgw64 results/quanjp_prime_01_10055digits.txt
 ```
+
+See `docs/OPENPFGW_INSTRUCTIONS.md` for the full workflow.
 
 ---
 
 ## Troubleshooting
 
-### "Compiled for release, not debug"
+**"No prime found in X attempts"**
+- Increase `max_attempts` in `Config::new()` in `src/main.rs`
+- Or reduce target size
+
+**"Out of memory"**
+- Reduce sequence length
+- Each 10K-digit search uses ~2–4GB RAM
+
+**"Database missing"**
 ```bash
-cargo build --release
-# (not cargo build)
+./target/release/ingest-history   # creates and populates data/prime_history.db
 ```
 
-### "Out of memory"
-- Reduce sequence length (fewer symbols = less memory)
-- Or run on machine with more RAM
-- Each search uses ~1-2GB
-
-### "No prime found in X attempts"
-- Target size too large for max_attempts limit
-- Increase `max_attempts` in `Config::new()`
-- Or reduce target digit size
-
-### "Database missing"
+**"Compiled without optimizations (slow)"**
 ```bash
-./target/release/ingest-history  # Auto-creates and populates
+cargo build --release   # always use --release
 ```
 
 ---
 
 ## Performance Tips
 
-1. **Use 15 cores on 16-core CPU** (reserve 1 for OS)
-2. **Target 4K-6K digits** for reliable, fast results
-3. **Run 8K+ overnight** (takes 20-30 minutes)
-4. **Disable background services** when running large searches
-5. **Use NVMe SSD** for SQLite database (if using DB)
+1. **Let it run all 16 cores** — current default, no action needed
+2. **Build the database first** — dramatically cuts attempts for 8K+ targets
+3. **Run overnight for 10K hunts** — typical time 3–20 min per prime
+4. **Disable heavy background services** during a run
+5. **NVMe SSD** helps for SQLite DB I/O (small effect overall)
 
 ---
 
-## Next Steps
+## File Organization
 
-1. ✅ Run with default config
-2. ✅ Try different target sizes
-3. ✅ Build database from results
-4. ✅ Experiment with entropy threshold
-5. 📖 Read `README.md` for technical details
-6. 📊 Check `DISCOVERIES.md` for performance insights
+All discovered primes live in `results/`:
 
----
+```
+results/
+├── quanjp_prime_NN_XXXXXdigits.txt   ← batch-run format (current)
+└── quanjp_ultimate_XXXXdigits.txt    ← legacy single-run format
+```
 
-## Questions?
-
-- 📖 See `docs/` folder for detailed guides
-- 🔧 Edit `src/main.rs` to understand the algorithm
-- 🗄️ Check `data/prime_history.db` via SQLite CLI
-- 📝 Review past discoveries in `results/` folder
+See `DISCOVERIES.md` for the full discovery log with timing data.
 
 ---
 
-**Happy Prime Hunting!** 🚀
+**Happy Prime Hunting!**
