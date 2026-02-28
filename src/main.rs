@@ -233,7 +233,6 @@ lazy_static! {
 #[derive(Clone)]
 struct Config {
     sequence_len: usize,
-    entropy_threshold: f64,
     primality_rounds: u32,
     max_attempts: u64,
     pattern_guide_ratio: f64,
@@ -252,7 +251,6 @@ impl Config {
 
         Self {
             sequence_len,
-            entropy_threshold: 1.88,
             primality_rounds: 15,
             max_attempts: 300_000,
             pattern_guide_ratio: 0.75,
@@ -274,7 +272,6 @@ struct Statistics {
     attempts: AtomicU64,
     symbolic_score_passed: AtomicU64,
     symbolic_residue_passed: AtomicU64,
-    entropy_passed: AtomicU64,
     partial_collapse_passed: AtomicU64,
     full_collapse_passed: AtomicU64,
     miller_rabin_passed: AtomicU64,
@@ -286,7 +283,6 @@ impl Statistics {
             attempts: AtomicU64::new(0),
             symbolic_score_passed: AtomicU64::new(0),
             symbolic_residue_passed: AtomicU64::new(0),
-            entropy_passed: AtomicU64::new(0),
             partial_collapse_passed: AtomicU64::new(0),
             full_collapse_passed: AtomicU64::new(0),
             miller_rabin_passed: AtomicU64::new(0),
@@ -297,7 +293,6 @@ impl Statistics {
         let total = self.attempts.load(Ordering::Relaxed);
         let ss = self.symbolic_score_passed.load(Ordering::Relaxed);
         let sr = self.symbolic_residue_passed.load(Ordering::Relaxed);
-        let ep = self.entropy_passed.load(Ordering::Relaxed);
         let pc = self.partial_collapse_passed.load(Ordering::Relaxed);
         let fc = self.full_collapse_passed.load(Ordering::Relaxed);
         let mr = self.miller_rabin_passed.load(Ordering::Relaxed);
@@ -306,10 +301,9 @@ impl Statistics {
         println!("   Total attempts:                {}", total);
         println!("   ① Symbolic score pass:         {} ({:.2}%)", ss, (ss as f64 / total.max(1) as f64 * 100.0));
         println!("   ② Symbolic residue pass:      {} ({:.2}%)", sr, (sr as f64 / ss.max(1) as f64 * 100.0));
-        println!("   ③ Entropy pass:                {} ({:.2}%)", ep, (ep as f64 / sr.max(1) as f64 * 100.0));
-        println!("   ④ Partial collapse pass:       {} ({:.2}%)", pc, (pc as f64 / ep.max(1) as f64 * 100.0));
-        println!("   ⑤ Full collapse required:      {} ({:.2}%)", fc, (fc as f64 / pc.max(1) as f64 * 100.0));
-        println!("   ⑥ Miller-Rabin pass:           {} ({:.2}%)", mr, (mr as f64 / fc.max(1) as f64 * 100.0));
+        println!("   ③ Partial collapse pass:       {} ({:.2}%)", pc, (pc as f64 / sr.max(1) as f64 * 100.0));
+        println!("   ④ Full collapse required:      {} ({:.2}%)", fc, (fc as f64 / pc.max(1) as f64 * 100.0));
+        println!("   ⑤ Miller-Rabin pass:           {} ({:.2}%)", mr, (mr as f64 / fc.max(1) as f64 * 100.0));
 
         let secs = duration.as_secs_f64().max(0.001);
         let rate = total as f64 / secs;
@@ -402,23 +396,6 @@ fn symbolic_residues(symbols: &[i8]) -> [u32; 8] {
 // STAGE 3: ENTROPY GATE (keep existing)
 // ============================================================================
 
-#[inline]
-fn entropy(symbols: &[i8]) -> f64 {
-    let mut counts = [0usize; 4];
-    for &s in symbols {
-        counts[(s + 1) as usize] += 1;
-    }
-    let total = symbols.len() as f64;
-
-    let mut entropy = 0.0;
-    for &count in &counts {
-        if count > 0 {
-            let p = count as f64 / total;
-            entropy -= p * p.log2();
-        }
-    }
-    entropy
-}
 
 // ============================================================================
 // STAGE 4: PARTIAL COLLAPSE (NEW - cheap checks before full collapse)
@@ -645,7 +622,6 @@ fn main() {
     println!("\n{}", "⚙️  Configuration:".bright_cyan().bold());
     println!("   Sequence length:        {}", config.sequence_len);
     println!("   Target digits:          ~{}", config.target_digits().to_string().bright_white().bold());
-    println!("   Entropy threshold:      {:.2}", config.entropy_threshold);
     println!("   Symbolic score gate:    > {:.2}", config.symbolic_score_threshold);
     println!("   Miller-Rabin rounds:    {}", config.primality_rounds);
     println!("   Max attempts:           {}", config.max_attempts);
@@ -656,10 +632,9 @@ fn main() {
     println!("   ② Oddness gate (symbols[0] parity — eliminates ~50%)");
     println!("   ③ Symbolic score gate (rejects ~60% of odd candidates)");
     println!("   ④ Symbolic residue filters mod {{3,5,7,11,13,17,19,23}}");
-    println!("   ⑤ Entropy threshold");
-    println!("   ⑥ Partial collapse checks");
-    println!("   ⑦ Full BigUint collapse (now rare!)");
-    println!("   ⑧ Miller-Rabin (bases 2,3,5 + {} random witnesses)", config.primality_rounds.saturating_sub(3));
+    println!("   ⑤ Partial collapse checks");
+    println!("   ⑥ Full BigUint collapse (now rare!)");
+    println!("   ⑦ Miller-Rabin (bases 2,3,5 + {} random witnesses)", config.primality_rounds.saturating_sub(3));
 
     println!("\n{}", "🚀 Starting Prime Hunt...".bright_green().bold());
 
@@ -720,14 +695,6 @@ fn main() {
         }
         stats.symbolic_residue_passed.fetch_add(1, Ordering::Relaxed);
 
-        // =====================================================================
-        // STAGE 3: Entropy gate
-        // =====================================================================
-        let ent = entropy(&symbols);
-        if ent < config.entropy_threshold {
-            return None;
-        }
-        stats.entropy_passed.fetch_add(1, Ordering::Relaxed);
 
         // =====================================================================
         // STAGE 4: Partial collapse check (cheap)
@@ -748,6 +715,14 @@ fn main() {
         // =====================================================================
         if is_prime_miller_rabin(&n, config.primality_rounds) {
             stats.miller_rabin_passed.fetch_add(1, Ordering::Relaxed);
+            let ent = {
+                let mut counts = [0usize; 4];
+                for &s in &symbols { counts[(s + 1) as usize] += 1; }
+                let total = symbols.len() as f64;
+                counts.iter().filter(|&&c| c > 0)
+                    .map(|&c| { let p = c as f64 / total; -p * p.log2() })
+                    .sum::<f64>()
+            };
             Some((n, ent, symbols))
         } else {
             None
