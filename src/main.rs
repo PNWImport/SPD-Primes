@@ -311,9 +311,17 @@ impl Statistics {
         println!("   ⑤ Full collapse required:      {} ({:.2}%)", fc, (fc as f64 / pc.max(1) as f64 * 100.0));
         println!("   ⑥ Miller-Rabin pass:           {} ({:.2}%)", mr, (mr as f64 / fc.max(1) as f64 * 100.0));
 
+        let secs = duration.as_secs_f64().max(0.001);
+        let rate = total as f64 / secs;
+        let collapse_rate = fc as f64 / secs;
+        let mr_rate = fc as f64 / secs;
         println!("\n{}", "⏱️  Performance:".bright_cyan().bold());
         println!("   Duration:                      {:.2?}", duration);
-        println!("   Rate:                          {:.0} attempts/sec", total as f64 / duration.as_secs_f64().max(0.001));
+        println!("   ── Flow rates ──────────────────────────────");
+        println!("   Candidates generated:          {:.1}/sec", rate);
+        println!("   Reach full collapse:           {:.2}/sec  ({:.1}% of generated)", collapse_rate, fc as f64 / total.max(1) as f64 * 100.0);
+        println!("   Reach Miller-Rabin:            {:.2}/sec", mr_rate);
+        println!("   ────────────────────────────────────────────");
     }
 }
 
@@ -607,7 +615,7 @@ fn main() {
     // =========================================================================
     // 🎯 CHANGE THIS LINE TO TARGET DIFFERENT DIGIT SIZES
     // =========================================================================
-    let config = Config::new(4096);   // Target: ~2,466 digits
+    let config = Config::new(8192);   // Target: ~4,932 digits
     // =========================================================================
 
     // Only initialize DB for larger targets (8K+) to avoid overhead
@@ -660,7 +668,7 @@ fn main() {
     let pb = ProgressBar::new(config.max_attempts);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed}] [{bar:40}] {pos}/{len} ({per_sec}) {msg}")
+            .template("{spinner:.green} [{elapsed_precise}] {pos}/{len} attempts | {per_sec} | ETA {eta} {msg}")
             .unwrap()
             .progress_chars("█▓▒░ "),
     );
@@ -670,8 +678,14 @@ fn main() {
     let result = (0..config.max_attempts).into_par_iter().find_map_any(|_| {
         let attempt = stats.attempts.fetch_add(1, Ordering::Relaxed);
 
-        if attempt % 50 == 0 {
+        if attempt % 100 == 0 {
             pb.set_position(attempt);
+            // Live rate: elapsed / attempts gives current throughput
+            let secs = now.elapsed().as_secs_f64();
+            if secs > 0.0 {
+                let rate = attempt as f64 / secs;
+                pb.set_message(format!("({:.0} att/s)", rate));
+            }
         }
 
         // =====================================================================
