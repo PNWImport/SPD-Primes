@@ -128,15 +128,25 @@ fn symbolic_score(symbols: &[i8], pattern: &PatternMatrix) -> f64 {
     score / symbols.len() as f64
 }
 
-const RESIDUE_MODS: [u32; 4] = [3, 5, 7, 11];
+/// Oddness gate: checks if the collapsed number would be odd.
+/// N = Σ val_i * 4^i. Since 4^i is even for i >= 1, parity depends only on val_0.
+/// val_0 is odd (1 or 3) when symbols[0] ∈ {-1, 1}. No prime > 2 is even.
+/// This single check eliminates ~50% of candidates before any expensive work.
+#[inline]
+fn is_symbolically_odd(symbols: &[i8]) -> bool {
+    // symbols[0]: -1 → val 3 (odd), 0 → val 0 (even), 1 → val 1 (odd), 2 → val 2 (even)
+    symbols[0] == -1 || symbols[0] == 1
+}
+
+const RESIDUE_MODS: [u32; 8] = [3, 5, 7, 11, 13, 17, 19, 23];
 
 #[inline]
-fn symbolic_residues(symbols: &[i8]) -> [u32; 4] {
-    let mut res = [0u32; 4];
-    let mut pow = [1u32; 4];
+fn symbolic_residues(symbols: &[i8]) -> [u32; 8] {
+    let mut res = [0u32; 8];
+    let mut pow = [1u32; 8];
     for &s in symbols {
         let val = if s == -1 { 3u32 } else { s as u32 };
-        for i in 0..4 {
+        for i in 0..8 {
             res[i] = (res[i] + val * pow[i]) % RESIDUE_MODS[i];
             pow[i] = (pow[i] * 4) % RESIDUE_MODS[i];
         }
@@ -181,6 +191,9 @@ fn collapse_fast(symbols: &[i8]) -> BigUint {
     result
 }
 
+/// Miller-Rabin with deterministic small bases first.
+/// Bases 2 and 3 catch most composites immediately — no RNG overhead,
+/// no BigUint random generation. Remaining rounds use random witnesses.
 #[inline]
 fn is_prime_miller_rabin(n: &BigUint, rounds: u32) -> bool {
     if n < &BigUint::from(2u32) { return false; }
@@ -190,17 +203,38 @@ fn is_prime_miller_rabin(n: &BigUint, rounds: u32) -> bool {
     let mut d = n_minus_1.clone();
     let mut r = 0u32;
     while !d.bit(0) { d >>= 1; r += 1; }
+
+    // Phase 1: deterministic bases (no RNG cost, catches most composites)
+    let det_bases: [u32; 3] = [2, 3, 5];
+    let det_count = det_bases.len().min(rounds as usize);
+    for &base in &det_bases[..det_count] {
+        let a = BigUint::from(base);
+        if &a >= &n_minus_1 { continue; }
+        let mut x = a.modpow(&d, n);
+        if x == BigUint::one() || x == n_minus_1 { continue; }
+        let mut composite = true;
+        for _ in 0..r.saturating_sub(1) {
+            x = x.modpow(&BigUint::from(2u32), n);
+            if x == n_minus_1 { composite = false; break; }
+        }
+        if composite { return false; }
+    }
+
+    // Phase 2: random witnesses for remaining rounds
+    let random_rounds = rounds.saturating_sub(det_count as u32);
+    if random_rounds == 0 { return true; }
     THREAD_RNG.with(|rng_cell| {
         let mut rng = rng_cell.borrow_mut();
-        'witness: for _ in 0..rounds {
+        for _ in 0..random_rounds {
             let a = rng.gen_biguint_range(&BigUint::from(2u32), &n_minus_1);
             let mut x = a.modpow(&d, n);
-            if x == BigUint::one() || x == n_minus_1 { continue 'witness; }
+            if x == BigUint::one() || x == n_minus_1 { continue; }
+            let mut composite = true;
             for _ in 0..r.saturating_sub(1) {
                 x = x.modpow(&BigUint::from(2u32), n);
-                if x == n_minus_1 { continue 'witness; }
+                if x == n_minus_1 { composite = false; break; }
             }
-            return false;
+            if composite { return false; }
         }
         true
     })
@@ -216,23 +250,27 @@ fn run_single_trial(
     sequence_len: usize,
     max_attempts: u64,
     pattern: &PatternMatrix,
+    mr_rounds: u32,
 ) -> Option<u64> {
     let attempts = AtomicU64::new(0);
     let score_threshold = 0.24f64;
     let entropy_threshold = 1.88f64;
 
     let result = (0..max_attempts).into_par_iter().find_map_any(|_| {
-        let attempt = attempts.fetch_add(1, Ordering::Relaxed);
-        let _ = attempt;
+        attempts.fetch_add(1, Ordering::Relaxed);
 
         let symbols = generate_symbolic_guided(sequence_len, pattern, 0.75);
+
+        // GATE 0: Oddness — costs 1 comparison, eliminates ~50% before anything else
+        if !is_symbolically_odd(&symbols) { return None; }
 
         let score = symbolic_score(&symbols, pattern);
         if score < score_threshold { return None; }
 
+        // Expanded residues: mod {3,5,7,11,13,17,19,23} — 8 primes, all u32
         let residues = symbolic_residues(&symbols);
-        if residues[0] == 0 || residues[1] == 0 || residues[2] == 0 || residues[3] == 0 {
-            return None;
+        for &r in &residues {
+            if r == 0 { return None; }
         }
 
         let ent = entropy(&symbols);
@@ -241,7 +279,7 @@ fn run_single_trial(
         if !partial_collapse_check(&symbols) { return None; }
 
         let n = collapse_fast(&symbols);
-        if is_prime_miller_rabin(&n, 15) { Some(()) } else { None }
+        if is_prime_miller_rabin(&n, mr_rounds) { Some(()) } else { None }
     });
 
     if result.is_some() {
@@ -319,6 +357,7 @@ struct Args {
     sequence_len: usize,
     max_attempts: u64,
     threads: usize,
+    mr_rounds: u32,
 }
 
 fn parse_args() -> Args {
@@ -327,6 +366,7 @@ fn parse_args() -> Args {
     let mut sequence_len = 4096usize;
     let mut max_attempts = 60_000u64;
     let mut threads = num_cpus::get_physical().saturating_sub(1).max(1);
+    let mut mr_rounds = 15u32;
 
     let mut i = 1;
     while i < args.len() {
@@ -335,12 +375,16 @@ fn parse_args() -> Args {
             "--sequence-len" => { i += 1; if i < args.len() { sequence_len = args[i].parse().unwrap_or(sequence_len); } }
             "--max-attempts" => { i += 1; if i < args.len() { max_attempts = args[i].parse().unwrap_or(max_attempts); } }
             "--threads"      => { i += 1; if i < args.len() { threads = args[i].parse().unwrap_or(threads); } }
+            "--mr-rounds"    => { i += 1; if i < args.len() { mr_rounds = args[i].parse().unwrap_or(mr_rounds); } }
             "--help" | "-h" => {
                 println!("Usage: batch-stats [OPTIONS]\n");
                 println!("  --trials N         Number of independent trials (default: 50)");
                 println!("  --sequence-len L   Symbol sequence length (default: 4096 → ~2466 digits)");
                 println!("  --max-attempts M   Give up on a trial after M attempts (default: 60000)");
                 println!("  --threads T        Rayon threads per trial (default: physical_cpus - 1)");
+                println!("  --mr-rounds R      Miller-Rabin rounds (default: 15, min 3)");
+                println!("                     First 3 use deterministic bases {{2,3,5}}; rest random.");
+                println!("                     P(false positive) <= 4^(-R). 15 → ~10^-9.");
                 std::process::exit(0);
             }
             _ => {}
@@ -348,7 +392,9 @@ fn parse_args() -> Args {
         i += 1;
     }
 
-    Args { trials, sequence_len, max_attempts, threads }
+    if mr_rounds < 3 { mr_rounds = 3; }
+
+    Args { trials, sequence_len, max_attempts, threads, mr_rounds }
 }
 
 // ============================================================================
@@ -372,6 +418,8 @@ fn main() {
     println!("  Sequence length  : {} symbols → ~{} digits", args.sequence_len, target_digits);
     println!("  Max per trial    : {} attempts", args.max_attempts);
     println!("  Rayon threads    : {}", args.threads);
+    println!("  M-R rounds       : {} (first 3 deterministic: bases 2,3,5)", args.mr_rounds);
+    println!("  Residue sieve    : mod {{3,5,7,11,13,17,19,23}} + oddness gate");
     println!();
     println!("  Null hypothesis  : mean attempts = ln(N) ≈ {:.0}", theoretical);
     println!("  Alt hypothesis   : mean attempts < {:.0}  (bias toward primes)", theoretical);
@@ -405,7 +453,7 @@ fn main() {
 
     for trial in 1..=args.trials {
         let trial_start = Instant::now();
-        let outcome = run_single_trial(args.sequence_len, args.max_attempts, &pattern);
+        let outcome = run_single_trial(args.sequence_len, args.max_attempts, &pattern, args.mr_rounds);
         let elapsed = trial_start.elapsed();
 
         match outcome {

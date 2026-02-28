@@ -364,16 +364,25 @@ fn symbolic_score(symbols: &[i8], pattern: &PatternMatrix) -> f64 {
 // STAGE 2: SYMBOLIC RESIDUE FILTERS (NEW - zero BigUint)
 // ============================================================================
 
-const RESIDUE_MODS: [u32; 4] = [3, 5, 7, 11];
+/// Oddness gate: checks if the collapsed number would be odd.
+/// N = Σ val_i * 4^i. Since 4^i is even for i >= 1, parity depends only on val_0.
+/// val_0 is odd (1 or 3) when symbols[0] ∈ {-1, 1}. No prime > 2 is even.
+/// This single check eliminates ~50% of candidates before any expensive work.
+#[inline]
+fn is_symbolically_odd(symbols: &[i8]) -> bool {
+    symbols[0] == -1 || symbols[0] == 1
+}
+
+const RESIDUE_MODS: [u32; 8] = [3, 5, 7, 11, 13, 17, 19, 23];
 
 #[inline]
-fn symbolic_residues(symbols: &[i8]) -> [u32; 4] {
-    let mut res = [0u32; 4];
-    let mut pow = [1u32; 4];
+fn symbolic_residues(symbols: &[i8]) -> [u32; 8] {
+    let mut res = [0u32; 8];
+    let mut pow = [1u32; 8];
 
     for &s in symbols {
         let val = if s == -1 { 3u32 } else { s as u32 };
-        for i in 0..4 {
+        for i in 0..8 {
             res[i] = (res[i] + val * pow[i]) % RESIDUE_MODS[i];
             pow[i] = (pow[i] * 4) % RESIDUE_MODS[i];
         }
@@ -453,6 +462,9 @@ fn collapse_fast(symbols: &[i8]) -> BigUint {
 // STAGE 6: VERIFICATION (Miller-Rabin)
 // ============================================================================
 
+/// Miller-Rabin with deterministic small bases first.
+/// Bases 2, 3, 5 catch most composites immediately — no RNG overhead,
+/// no BigUint random generation. Remaining rounds use random witnesses.
 #[inline]
 fn is_prime_miller_rabin(n: &BigUint, rounds: u32) -> bool {
     if n < &BigUint::from(2u32) {
@@ -461,36 +473,50 @@ fn is_prime_miller_rabin(n: &BigUint, rounds: u32) -> bool {
     if n == &BigUint::from(2u32) || n == &BigUint::from(3u32) {
         return true;
     }
-    if n.bit(0) == false {
+    if !n.bit(0) {
         return false;
     }
 
     let n_minus_1 = n - BigUint::one();
     let mut d = n_minus_1.clone();
     let mut r = 0u32;
-    while d.bit(0) == false {
+    while !d.bit(0) {
         d >>= 1;
         r += 1;
     }
 
+    // Phase 1: deterministic bases (no RNG cost, catches most composites)
+    let det_bases: [u32; 3] = [2, 3, 5];
+    let det_count = det_bases.len().min(rounds as usize);
+    for &base in &det_bases[..det_count] {
+        let a = BigUint::from(base);
+        if &a >= &n_minus_1 { continue; }
+        let mut x = a.modpow(&d, n);
+        if x == BigUint::one() || x == n_minus_1 { continue; }
+        let mut composite = true;
+        for _ in 0..r.saturating_sub(1) {
+            x = x.modpow(&BigUint::from(2u32), n);
+            if x == n_minus_1 { composite = false; break; }
+        }
+        if composite { return false; }
+    }
+
+    // Phase 2: random witnesses for remaining rounds
+    let random_rounds = rounds.saturating_sub(det_count as u32);
+    if random_rounds == 0 { return true; }
     THREAD_RNG.with(|rng_cell| {
         let mut rng = rng_cell.borrow_mut();
 
-        'witness: for _ in 0..rounds {
+        for _ in 0..random_rounds {
             let a = rng.gen_biguint_range(&BigUint::from(2u32), &n_minus_1);
             let mut x = a.modpow(&d, n);
-
-            if x == BigUint::one() || x == n_minus_1 {
-                continue 'witness;
-            }
-
+            if x == BigUint::one() || x == n_minus_1 { continue; }
+            let mut composite = true;
             for _ in 0..r.saturating_sub(1) {
                 x = x.modpow(&BigUint::from(2u32), n);
-                if x == n_minus_1 {
-                    continue 'witness;
-                }
+                if x == n_minus_1 { composite = false; break; }
             }
-            return false;
+            if composite { return false; }
         }
         true
     })
@@ -619,12 +645,13 @@ fn main() {
 
     println!("\n{}", "🔧 Symbolic-First Pipeline:".bright_cyan().bold());
     println!("   ① Symbolic generation");
-    println!("   ② Symbolic score gate (rejects ~60%)");
-    println!("   ③ Symbolic residue filters (rejects ~90%)");
-    println!("   ④ Entropy threshold (rejects ~95%)");
-    println!("   ④ Partial collapse checks (rejects ~99%)");
-    println!("   ⑤ Full BigUint collapse (now rare!)");
-    println!("   ⑥ Miller-Rabin verification (final check)");
+    println!("   ② Oddness gate (symbols[0] parity — eliminates ~50%)");
+    println!("   ③ Symbolic score gate (rejects ~60% of odd candidates)");
+    println!("   ④ Symbolic residue filters mod {{3,5,7,11,13,17,19,23}}");
+    println!("   ⑤ Entropy threshold");
+    println!("   ⑥ Partial collapse checks");
+    println!("   ⑦ Full BigUint collapse (now rare!)");
+    println!("   ⑧ Miller-Rabin (bases 2,3,5 + {} random witnesses)", config.primality_rounds.saturating_sub(3));
 
     println!("\n{}", "🚀 Starting Prime Hunt...".bright_green().bold());
 
@@ -653,6 +680,13 @@ fn main() {
         let symbols = generate_symbolic_guided(config.sequence_len, &pattern_matrix, config.pattern_guide_ratio);
 
         // =====================================================================
+        // STAGE 0.5: Oddness gate — 1 comparison, eliminates ~50%
+        // =====================================================================
+        if !is_symbolically_odd(&symbols) {
+            return None;
+        }
+
+        // =====================================================================
         // STAGE 1: Symbolic score gate (O(n) int ops only)
         // =====================================================================
         let score = symbolic_score(&symbols, &pattern_matrix);
@@ -662,12 +696,12 @@ fn main() {
         stats.symbolic_score_passed.fetch_add(1, Ordering::Relaxed);
 
         // =====================================================================
-        // STAGE 2: Symbolic residue filters (zero BigUint)
+        // STAGE 2: Symbolic residue filters — mod {3,5,7,11,13,17,19,23}
         // =====================================================================
         let residues = symbolic_residues(&symbols);
 
         // Reject if divisible by any small prime (residue = 0)
-        if residues[0] == 0 || residues[1] == 0 || residues[2] == 0 || residues[3] == 0 {
+        if residues.iter().any(|&r| r == 0) {
             return None;
         }
         stats.symbolic_residue_passed.fetch_add(1, Ordering::Relaxed);
