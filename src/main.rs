@@ -258,7 +258,7 @@ impl Config {
         Self {
             sequence_len,
             primality_rounds: 15,
-            max_attempts: 300_000,
+            max_attempts: 500_000,
             pattern_guide_ratio: 0.75,
             num_threads,
             symbolic_score_threshold: 0.24,  // Tier 3: Baseline (patterns naturally score high)
@@ -643,7 +643,7 @@ fn main() {
     // =========================================================================
     // 🎯 CHANGE THIS LINE TO TARGET DIFFERENT DIGIT SIZES
     // =========================================================================
-    let config = Config::new(16700);  // Target: ~10,053 digits
+    let config = Config::new(33200);  // Target: ~20,000 digits ← RECORD HUNT
     // =========================================================================
 
     // Only initialize DB for larger targets (8K+) to avoid overhead
@@ -687,9 +687,9 @@ fn main() {
     println!("   ⑥ Full GMP Integer collapse (now rare!)");
     println!("   ⑦ Miller-Rabin (bases 2,3,5 + {} random witnesses)", config.primality_rounds.saturating_sub(3));
 
-    println!("\n{}", "🚀 Starting Prime Hunt — TARGET: 10 PRIMES".bright_green().bold());
+    println!("\n{}", "🚀 Starting Prime Hunt — TARGET: 1 RECORD PRIME (20,000 DIGITS)".bright_green().bold());
 
-    let target_count = 10usize;
+    let target_count = 1usize;
     let mut primes_found = 0usize;
     let mut total_attempts: u64 = 0;
     let hunt_start = Instant::now();
