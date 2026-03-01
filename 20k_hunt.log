@@ -17,7 +17,7 @@
    Target digits:          ~19987
    Symbolic score gate:    > 0.24
    Miller-Rabin rounds:    15
-   Max attempts:           500000
+   Max attempts:           2000000
    Pattern guidance:       75%
 
 🔧 Symbolic-First Pipeline:

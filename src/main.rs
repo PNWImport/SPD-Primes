@@ -258,7 +258,7 @@ impl Config {
         Self {
             sequence_len,
             primality_rounds: 15,
-            max_attempts: 500_000,
+            max_attempts: 2_000_000,
             pattern_guide_ratio: 0.75,
             num_threads,
             symbolic_score_threshold: 0.24,  // Tier 3: Baseline (patterns naturally score high)
