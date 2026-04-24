@@ -2,6 +2,7 @@
 Cargo.lock
 *.json
 data/*.db
+*.db
 *.swp
 *.swo
 .DS_Store
