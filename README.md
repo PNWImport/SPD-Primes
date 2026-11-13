@@ -154,6 +154,20 @@ struct Config {
 
 ## Performance
 
+### Deep-sieve pipeline (Nov 2026, measured on a 4-core machine)
+
+| Target | Before | After | Notes |
+|--------|--------|-------|-------|
+| ~1,233 digits | 2.82 s per prime (546 tests) | ~0.7 s per prime (~107 tests) | 40 primes per run |
+| ~10,055 digits | ~3,790 tests per prime expected | 881 tests, 835 s (one run) | sieve bound 9.8×10⁸, 5.40% of odd candidates survive |
+
+At 10K digits the sieve leaves about 625 tests per prime on average, against about 3,790
+for the earlier filter — roughly 6× fewer. A single hunt still varies a lot around that
+average (the run above needed 881). Sieving took 30 s of the 835 s. Memory use is ~10 MB;
+the earlier power-of-4 table held about 5 GB.
+
+The timings in the sections below and in `DISCOVERIES.md` were recorded with the earlier pipeline.
+
 ### Threading (16-core system)
 
 Current config uses all 16 cores. Earlier experiments at 4K targets showed 15 cores
