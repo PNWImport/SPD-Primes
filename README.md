@@ -109,6 +109,29 @@ versus 32.7% for the earlier fixed filter (primes up to 23).
 The window holds ~30 expected primes, and survivors are tested in random order.
 The symbols saved with each prime are the base-4 digits of the prime itself.
 
+### 3. Proth Mode — Proven Primes from Structured Symbols
+
+```bash
+cargo build --release --bin proth-hunter
+./target/release/proth-hunter [n_symbols] [how_many_primes]
+./target/release/proth-hunter 16700     # one proven ~10,060-digit prime
+```
+
+Searches numbers of the form `k·4^n + 1`. In the symbol alphabet that is a `1`, then
+`n − 1` zeros, then the short head of `k`. The shape buys two things:
+
+- **The sieve never builds a big number.** A prime `p` divides `k·4^n + 1` exactly when
+  `k ≡ −(4^n)⁻¹ (mod p)`, which is word-sized arithmetic on `k` and `n`.
+- **The result is a proof.** Proth's theorem: if `a^((N−1)/2) ≡ −1 (mod N)`, then `N` is
+  prime. One modular exponentiation, no "probable".
+
+Measured on 4 cores at ~1,233 digits: about 0.5 s per **proven** prime, versus 0.73 s per
+probable prime in the general hunter (same cost per test; no confirmation rounds needed).
+Profile: 99.5% of the time is the modular exponentiation, 0.5% the sieve.
+
+Results are written as `proth_NN_XXXXdigits.txt` with the form, the witness `a`, the
+prime and its symbols.
+
 ### 3. Historical Learning Database
 - SQLite stores every discovered prime (timestamp, digit count, entropy, symbol sequence, PhaseToken hashes)
 - Loaded automatically for targets ≥ 8,000 digits
