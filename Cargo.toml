@@ -16,6 +16,8 @@ lazy_static = "1.4"
 colored = "2.1"
 sha3 = "0.10"
 rusqlite = { version = "0.30", features = ["bundled"] }
+num-bigint = { version = "0.4", features = ["rand"] }
+num-traits = "0.2"
 
 [[bin]]
 name = "quanjp-prime-hunter"

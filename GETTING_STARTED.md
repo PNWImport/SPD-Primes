@@ -29,16 +29,17 @@ Binaries:
 ```
 
 **What happens:**
-1. Detects 16 CPUs, uses all 16 threads
+1. Detects your CPUs and uses all physical cores
 2. Loads training patterns from `data/prime_history.db` (if available)
-3. Searches for a ~10,053-digit prime (sequence length 16,700)
-4. Saves result to `results/quanjp_prime_NN_XXXXXdigits.txt`
+3. Builds a symbolic seed of the target size (~20,000 digits by default)
+4. Sieves the window `seed, seed+2, seed+4, …` and tests the survivors on all cores
+5. Saves the result to `quanjp_prime_NN_XXXXXdigits.txt` in the current directory
 
-**Expected output:**
+**Expected output (10K-digit run, `quanjp-prime-hunter 16700`):**
 
 ```
 🚀 QuanJP Prime Hunter 2050 - SYMBOLIC-FIRST EDITION
-   ⚡ Tier 3: Symbolic exploration + numeric verification
+   ⚡ Symbolic seed + deep sieve + numeric verification
 
 💻 System Detection:
    Physical CPUs:  16
@@ -51,45 +52,38 @@ Binaries:
 ⚙️  Configuration:
    Sequence length:        16700
    Target digits:          ~10054
-   Symbolic score gate:    > 0.24
-   Miller-Rabin rounds:    15
-   Max attempts:           300000
+   Primes to find:         1
+   Miller-Rabin rounds:    15 (+ Baillie-PSW)
    Pattern guidance:       75%
 
-🔍 Hunt 1/10 ...
+🔍 Hunt 1/1 ...
 
-✅ 🎉 PRIME DISCOVERED!
+✅ 🎉 PRIME #1 DISCOVERED!
    Digits:      10055
-   Duration:    213.37s
-   Attempts:    6,764
+   Hunt time:   ...
 
-💾 Saved to results/quanjp_prime_01_10055digits.txt
+📊 Pipeline Statistics:
+   Sieve bound:                   ...
+   Survived sieve:                ...
+   Primality tests run:           ...
+
+💾 Saved to quanjp_prime_01_10055digits.txt
 ```
 
 ---
 
 ## Changing Target Digit Size
 
-Edit `src/main.rs` line 646:
-
-```rust
-let config = Config::new(16700);  // ~10,053 digits
-```
-
-### Common Targets
-
-```rust
-Config::new(4096)    // ~2,466 digits  — ~20–40s
-Config::new(8192)    // ~4,932 digits  — ~100–200s
-Config::new(13300)   // ~8,000 digits  — 8–15 min
-Config::new(16700)   // ~10,053 digits — 3–20 min  ← default
-```
-
-Then rebuild and run:
+Pass the sequence length (and optionally how many primes to find) on the command line.
+No rebuild needed. Digits ≈ sequence length × 0.602.
 
 ```bash
-cargo build --release
-./target/release/quanjp-prime-hunter
+./target/release/quanjp-prime-hunter 4096       # ~2,466 digits
+./target/release/quanjp-prime-hunter 8192       # ~4,932 digits
+./target/release/quanjp-prime-hunter 13300      # ~8,000 digits
+./target/release/quanjp-prime-hunter 16700      # ~10,053 digits
+./target/release/quanjp-prime-hunter 33200      # ~20,000 digits  ← default with no argument
+./target/release/quanjp-prime-hunter 8192 10    # ten ~4,932-digit primes in one run
 ```
 
 ---
@@ -183,13 +177,11 @@ See `docs/OPENPFGW_INSTRUCTIONS.md` for the full workflow.
 
 ## Troubleshooting
 
-**"No prime found in X attempts"**
-- Increase `max_attempts` in `Config::new()` in `src/main.rs`
-- Or reduce target size
+**"Window exhausted"**
+- Extremely unlikely (the window holds ~30 expected primes); the hunter picks a new seed and continues on its own
 
 **"Out of memory"**
 - Reduce sequence length
-- Each 10K-digit search uses ~2–4GB RAM
 
 **"Database missing"**
 ```bash

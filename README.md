@@ -12,8 +12,9 @@ A high-performance Rust application for discovering large probable primes (thous
 # Build with optimizations
 cargo build --release
 
-# Run prime hunter (10,000+ digit target by default)
+# Run prime hunter (~20,000 digits by default; pass a sequence length to change it)
 ./target/release/quanjp-prime-hunter
+./target/release/quanjp-prime-hunter 16700   # ~10,053 digits
 
 # Ingest historical results into the learning database
 cargo build --release --bin ingest-history
@@ -74,27 +75,39 @@ SPD-Primes/
 
 ## How It Works
 
-### 1. ML-Guided Symbolic Generation
-- Learns a Markov transition matrix from previously discovered prime sequences
-- Uses a 4-symbol alphabet: `{-1, 0, 1, 2}`
-- Generates candidates with 75% probability following learned patterns, 25% random exploration
-- Each new prime found improves future runs (cumulative learning)
+### 1. Symbolic Seed Generation
+- Uses a 4-symbol alphabet: `{-1, 0, 1, 2}` — each symbol is one base-4 digit (`-1` stands for 3)
+- A Markov transition matrix learned from previously discovered prime sequences shapes the seed
+  (75% learned transitions, 25% random exploration)
+- The seed is forced odd and its top symbol non-zero, so it always has the target size
 
-### 2. Symbolic-First Pipeline (Tier 3)
+> **Measured, Nov 2026:** in a controlled test (3,000 primes per arm at ~308 digits) the
+> pattern-guided generator and plain uniform random digits needed the same number of
+> primality tests per prime (118 vs 114, expected 116). The guidance shapes the seed but
+> does not raise the hit rate — the speed comes from the sieve below.
+
+### 2. Deep-Sieve Pipeline
 
 ```
-Generate → Score → Residues → Partial Collapse → Full Collapse → Miller-Rabin
+Symbolic seed → Sieve window → Strong test base 2 → Confirm (Miller-Rabin + Baillie-PSW)
 ```
 
-| Stage | Operation | Rejection |
-|-------|-----------|-----------|
-| ① | Symbolic score gate (O(n) pattern match) | ~50% |
-| ② | Symbolic residue mod {3,5,7,11,13,17,19,23} | ~60% of remaining |
-| ③ | Partial collapse — parity + mod 65537 | ~25% of remaining |
-| ④ | Full GMP integer collapse | only ~12% of candidates reach here |
-| ⑤ | Miller-Rabin (15 rounds, 2,3,5 + 12 random witnesses) | ~99.96% |
+| Stage | Operation | Effect |
+|-------|-----------|--------|
+| ① | Symbolic seed, collapsed to an integer by O(n) bit packing | one seed per hunt |
+| ② | Sieve the window `seed, seed+2, seed+4, …` with every prime up to an auto-tuned bound | ~93–95% of odd candidates removed |
+| ③ | One strong probable-prime test (base 2) per survivor, all cores | the only expensive step |
+| ④ | First survivor to pass: 15 Miller-Rabin rounds + GMP Baillie-PSW, run in parallel | confirmation |
 
-**Key result:** Only ~12% of candidates require an expensive big-integer construction. The rest are eliminated by cheap symbolic operations.
+**Why the sieve matters:** every candidate that reaches stage ③ costs a full modular
+exponentiation (seconds at 10K digits). Striking it out because a small prime divides it
+costs one `seed mod p` (about a microsecond). The sieve bound is chosen per run where those
+two costs break even, measured on the machine: about 10⁷ at 1,200 digits, up to the 2³² cap
+at 10K+ digits. The fraction of odd numbers that survive a sieve to `B` is `1.123 / ln(B)`,
+versus 32.7% for the earlier fixed filter (primes up to 23).
+
+The window holds ~30 expected primes, and survivors are tested in random order.
+The symbols saved with each prime are the base-4 digits of the prime itself.
 
 ### 3. Historical Learning Database
 - SQLite stores every discovered prime (timestamp, digit count, entropy, symbol sequence, PhaseToken hashes)
@@ -105,31 +118,35 @@ Generate → Score → Residues → Partial Collapse → Full Collapse → Mille
 
 ## Configuration
 
-Edit `src/main.rs` line 646:
+Target size and count are command-line arguments — no rebuild needed:
 
-```rust
-let config = Config::new(16700);  // Target: ~10,053 digits
+```bash
+./target/release/quanjp-prime-hunter [sequence_len] [how_many_primes]
+
+./target/release/quanjp-prime-hunter 16700      # one ~10,053-digit prime
+./target/release/quanjp-prime-hunter 8192 10    # ten ~4,932-digit primes
+./target/release/quanjp-prime-hunter            # default: one ~20,000-digit prime
 ```
 
-### Sequence Length Reference
+Digits ≈ `sequence_len × 0.602`.
 
-| Target Digits | Sequence Length | Typical Time (16 cores) |
-|---|---|---|
-| ~2,466 | 4,096 | 20–40s |
-| ~4,932 | 8,192 | 100–200s |
-| ~8,000 | 13,300 | 8–15min |
-| ~10,053 | 16,700 | 3–20min |
+| Target Digits | Sequence Length |
+|---|---|
+| ~2,466 | 4,096 |
+| ~4,932 | 8,192 |
+| ~8,000 | 13,300 |
+| ~10,053 | 16,700 |
+| ~20,000 | 33,200 |
 
 ### Config Parameters (`src/main.rs`)
 
 ```rust
 struct Config {
     sequence_len: usize,           // Symbol sequence length
-    primality_rounds: u32,         // Miller-Rabin rounds: 15
-    max_attempts: u64,             // Search limit: 300,000
-    pattern_guide_ratio: f64,      // Learned pattern use: 75%
+    primality_rounds: u32,         // Miller-Rabin confirmation rounds: 15
+    pattern_guide_ratio: f64,      // Learned pattern use in the seed: 75%
     num_threads: usize,            // All physical cores (auto-detect)
-    symbolic_score_threshold: f64, // Tier 3 gate: 0.24
+    window_expected_primes: f64,   // Window size, in expected primes: 30
 }
 ```
 
@@ -237,7 +254,7 @@ See `docs/OPENPFGW_INSTRUCTIONS.md` and `docs/VALIDATION_GUIDE.md` for full work
 
 - [ ] 16K+ digit prime hunt
 - [ ] ECPP verification for proven (not just probable) primes
-- [ ] GPU acceleration for Miller-Rabin (CUDA port of `collapse_fast()`)
+- [ ] GPU acceleration for Miller-Rabin
 - [ ] Distributed search across multiple machines
 - [ ] Submit to Prime Pages (T5K)
 

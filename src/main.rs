@@ -1,10 +1,9 @@
 use rand::prelude::*;
 use rayon::prelude::*;
-use rug::{Integer, rand::RandState};
+use rug::{Integer, integer::{IsPrime, Order}, rand::RandState};
 use std::time::Instant;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use indicatif::{ProgressBar, ProgressStyle};
-use lazy_static::lazy_static;
 use colored::*;
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_512};
@@ -36,6 +35,7 @@ thread_local! {
 // ============================================================================
 
 fn init_database() -> rusqlite::Result<Connection> {
+    std::fs::create_dir_all("data").ok();
     let conn = Connection::open("data/prime_history.db")?;
 
     conn.execute(
@@ -218,23 +218,6 @@ impl PatternMatrix {
     }
 }
 
-// ============================================================================
-// POWER CACHE
-// ============================================================================
-
-lazy_static! {
-    static ref POWER_CACHE: Vec<Integer> = {
-        let mut cache = Vec::with_capacity(200000);
-        let four = Integer::from(4u32);
-        let mut power = Integer::from(1u32);
-
-        for _ in 0..200000 {
-            cache.push(power.clone());
-            power *= &four;
-        }
-        cache
-    };
-}
 
 // ============================================================================
 // CONFIGURATION
@@ -244,10 +227,10 @@ lazy_static! {
 struct Config {
     sequence_len: usize,
     primality_rounds: u32,
-    max_attempts: u64,
     pattern_guide_ratio: f64,
     num_threads: usize,
-    symbolic_score_threshold: f64,
+    /// Window size as a multiple of ln(N): the expected number of primes inside it.
+    window_expected_primes: f64,
 }
 
 impl Config {
@@ -258,10 +241,9 @@ impl Config {
         Self {
             sequence_len,
             primality_rounds: 15,
-            max_attempts: 2_000_000,
             pattern_guide_ratio: 0.75,
             num_threads,
-            symbolic_score_threshold: 0.24,  // Tier 3: Baseline (patterns naturally score high)
+            window_expected_primes: 30.0,
         }
     }
 
@@ -271,62 +253,7 @@ impl Config {
 }
 
 // ============================================================================
-// STATISTICS TRACKING
-// ============================================================================
-
-struct Statistics {
-    attempts: AtomicU64,
-    symbolic_score_passed: AtomicU64,
-    symbolic_residue_passed: AtomicU64,
-    partial_collapse_passed: AtomicU64,
-    full_collapse_passed: AtomicU64,
-    miller_rabin_passed: AtomicU64,
-}
-
-impl Statistics {
-    fn new() -> Self {
-        Self {
-            attempts: AtomicU64::new(0),
-            symbolic_score_passed: AtomicU64::new(0),
-            symbolic_residue_passed: AtomicU64::new(0),
-            partial_collapse_passed: AtomicU64::new(0),
-            full_collapse_passed: AtomicU64::new(0),
-            miller_rabin_passed: AtomicU64::new(0),
-        }
-    }
-
-    fn print_summary(&self, duration: std::time::Duration) {
-        let total = self.attempts.load(Ordering::Relaxed);
-        let ss = self.symbolic_score_passed.load(Ordering::Relaxed);
-        let sr = self.symbolic_residue_passed.load(Ordering::Relaxed);
-        let pc = self.partial_collapse_passed.load(Ordering::Relaxed);
-        let fc = self.full_collapse_passed.load(Ordering::Relaxed);
-        let mr = self.miller_rabin_passed.load(Ordering::Relaxed);
-
-        println!("\n{}", "📊 Symbolic-First Pipeline Statistics:".bright_cyan().bold());
-        println!("   Total attempts:                {}", total);
-        println!("   ① Symbolic score pass:         {} ({:.2}%)", ss, (ss as f64 / total.max(1) as f64 * 100.0));
-        println!("   ② Symbolic residue pass:      {} ({:.2}%)", sr, (sr as f64 / ss.max(1) as f64 * 100.0));
-        println!("   ③ Partial collapse pass:       {} ({:.2}%)", pc, (pc as f64 / sr.max(1) as f64 * 100.0));
-        println!("   ④ Full collapse required:      {} ({:.2}%)", fc, (fc as f64 / pc.max(1) as f64 * 100.0));
-        println!("   ⑤ Miller-Rabin pass:           {} ({:.2}%)", mr, (mr as f64 / fc.max(1) as f64 * 100.0));
-
-        let secs = duration.as_secs_f64().max(0.001);
-        let rate = total as f64 / secs;
-        let collapse_rate = fc as f64 / secs;
-        let mr_rate = fc as f64 / secs;
-        println!("\n{}", "⏱️  Performance:".bright_cyan().bold());
-        println!("   Duration:                      {:.2?}", duration);
-        println!("   ── Flow rates ──────────────────────────────");
-        println!("   Candidates generated:          {:.1}/sec", rate);
-        println!("   Reach full collapse:           {:.2}/sec  ({:.1}% of generated)", collapse_rate, fc as f64 / total.max(1) as f64 * 100.0);
-        println!("   Reach Miller-Rabin:            {:.2}/sec", mr_rate);
-        println!("   ────────────────────────────────────────────");
-    }
-}
-
-// ============================================================================
-// STAGE 0: SYMBOLIC GENERATION (unchanged, already excellent)
+// STAGE 1: SYMBOLIC SEED GENERATION
 // ============================================================================
 
 #[inline]
@@ -346,115 +273,171 @@ fn generate_symbolic_guided(length: usize, pattern: &PatternMatrix, guide_ratio:
                 symbols.push(*[-1, 0, 1, 2].choose(&mut *rng).unwrap());
             }
         }
+
+        // Top symbol must be non-zero so the number really has the target size.
+        if let Some(top) = symbols.last_mut() {
+            if *top == 0 {
+                *top = *[-1, 1, 2].choose(&mut *rng).unwrap();
+            }
+        }
     });
 
     symbols
 }
 
 // ============================================================================
-// STAGE 1: SYMBOLIC SCORE GATE (NEW - O(n) int ops only)
+// SYMBOLS <-> INTEGER (O(n) bit packing: each symbol is one base-4 digit)
 // ============================================================================
 
-#[inline]
-fn symbolic_score(symbols: &[i8], pattern: &PatternMatrix) -> f64 {
-    let mut score = 0.0;
-    for i in 1..symbols.len() {
-        let a = (symbols[i-1] + 1) as usize;
-        let b = (symbols[i] + 1) as usize;
-        if a < 4 && b < 4 {
-            score += pattern.transitions[a][b];
-        }
-    }
-    score / symbols.len() as f64
-}
-
-// ============================================================================
-// STAGE 2: SYMBOLIC RESIDUE FILTERS (NEW - zero BigUint)
-// ============================================================================
-
-/// Oddness gate: checks if the collapsed number would be odd.
-/// N = Σ val_i * 4^i. Since 4^i is even for i >= 1, parity depends only on val_0.
-/// val_0 is odd (1 or 3) when symbols[0] ∈ {-1, 1}. No prime > 2 is even.
-/// This single check eliminates ~50% of candidates before any expensive work.
-#[inline]
-fn is_symbolically_odd(symbols: &[i8]) -> bool {
-    symbols[0] == -1 || symbols[0] == 1
-}
-
-const RESIDUE_MODS: [u32; 8] = [3, 5, 7, 11, 13, 17, 19, 23];
-
-#[inline]
-fn symbolic_residues(symbols: &[i8]) -> [u32; 8] {
-    let mut res = [0u32; 8];
-    let mut pow = [1u32; 8];
-
-    for &s in symbols {
-        let val = if s == -1 { 3u32 } else { s as u32 };
-        for i in 0..8 {
-            res[i] = (res[i] + val * pow[i]) % RESIDUE_MODS[i];
-            pow[i] = (pow[i] * 4) % RESIDUE_MODS[i];
-        }
-    }
-    res
-}
-
-// ============================================================================
-// STAGE 3: ENTROPY GATE (keep existing)
-// ============================================================================
-
-
-// ============================================================================
-// STAGE 4: PARTIAL COLLAPSE (NEW - cheap checks before full collapse)
-// ============================================================================
-
-#[inline]
-fn partial_collapse_check(symbols: &[i8]) -> bool {
-    // Build lower K limbs only (first 256 symbols)
-    let check_len = symbols.len().min(256);
-
-    let mut parity_count = 0u32;
-    let mut mod_65537_acc = 0u32;
-    let mut pow_65537 = 1u32;
-
-    for &s in &symbols[..check_len] {
-        let val = if s == -1 { 3u32 } else { s as u32 };
-
-        parity_count ^= val;
-        mod_65537_acc = (mod_65537_acc + val * pow_65537) % 65537;
-        pow_65537 = (pow_65537 * 4) % 65537;
-    }
-
-    // Reject if obviously wrong
-    // Primes typically have mixed parity patterns
-    // And non-zero residue mod 65537
-    // Also reject if parity is too imbalanced
-    let balanced_parity = parity_count > 0 && parity_count < 256;
-    mod_65537_acc != 0 && balanced_parity
-}
-
-// ============================================================================
-// STAGE 5: FULL COLLAPSE (rare now)
-// ============================================================================
-
-#[inline]
-fn collapse_fast(symbols: &[i8]) -> Integer {
-    let mut result = Integer::new();
-
+/// N = Σ val_i * 4^i, with symbol -1 standing for digit 3.
+/// A base-4 digit is exactly two bits, so the symbols pack straight into bytes.
+fn collapse(symbols: &[i8]) -> Integer {
+    let mut bytes = vec![0u8; (symbols.len() + 3) / 4];
     for (i, &s) in symbols.iter().enumerate() {
-        let val = if s == -1 { 3u32 } else { s as u32 };
-        if val > 0 {
-            let mut term = POWER_CACHE[i].clone();
-            term *= val;
-            result += term;
+        let val = if s == -1 { 3u8 } else { s as u8 };
+        bytes[i / 4] |= val << (2 * (i % 4));
+    }
+    Integer::from_digits(&bytes, Order::Lsf)
+}
+
+/// Inverse of `collapse`, zero-padded to at least `min_len` symbols.
+fn symbols_of(n: &Integer, min_len: usize) -> Vec<i8> {
+    let bytes = n.to_digits::<u8>(Order::Lsf);
+    let mut symbols = Vec::with_capacity((bytes.len() * 4).max(min_len));
+    for b in bytes {
+        for j in 0..4 {
+            let val = (b >> (2 * j)) & 3;
+            symbols.push(if val == 3 { -1 } else { val as i8 });
         }
     }
-    result
+    while symbols.len() > min_len && symbols.last() == Some(&0) {
+        symbols.pop();
+    }
+    symbols.resize(symbols.len().max(min_len), 0);
+    symbols
 }
 
 // ============================================================================
-// STAGE 6: VERIFICATION (Miller-Rabin)
+// STAGE 2: DEEP SIEVE OVER A WINDOW  seed, seed+2, seed+4, ...
+// ============================================================================
+//
+// Every candidate that reaches a primality test costs one full modular
+// exponentiation. Removing a candidate because a small prime p divides it costs
+// one `seed mod p`. So we strike out multiples of every prime up to a bound
+// chosen where those two costs break even, and only test what survives.
+// The fraction of odd numbers surviving a sieve to B is about 1.123 / ln(B).
+
+/// Odd primes below `limit` (limit <= 65536 is all the segmented sieve needs).
+fn base_primes(limit: u64) -> Vec<u32> {
+    let limit = limit as usize;
+    let mut is_comp = vec![false; limit + 1];
+    let mut out = Vec::new();
+    let mut i = 3usize;
+    while i <= limit {
+        if !is_comp[i] {
+            out.push(i as u32);
+            let mut j = i * i;
+            while j <= limit {
+                is_comp[j] = true;
+                j += 2 * i;
+            }
+        }
+        i += 2;
+    }
+    out
+}
+
+/// Strike every window offset k where p divides seed + 2k.
+#[inline]
+fn strike(seed: &Integer, p: u32, composite: &[AtomicBool]) {
+    let r = seed.mod_u(p) as u64;
+    let p64 = p as u64;
+    // Solve seed + 2k ≡ 0 (mod p) for the smallest k >= 0.
+    let neg = if r == 0 { 0 } else { p64 - r };
+    let mut k = if neg % 2 == 0 { neg / 2 } else { (neg + p64) / 2 };
+    let w = composite.len() as u64;
+    while k < w {
+        composite[k as usize].store(true, Ordering::Relaxed);
+        k += p64;
+    }
+}
+
+const SEGMENT_SPAN: u64 = 1 << 21; // numbers per segment (odd-only => 1M flags)
+
+/// Sieve the window with all odd primes in [3, bound). Parallel over segments.
+fn sieve_window(seed: &Integer, composite: &[AtomicBool], bound: u64) {
+    let root = (bound as f64).sqrt() as u64 + 1;
+    let small = base_primes(root.max(3));
+    let segments = (bound + SEGMENT_SPAN - 1) / SEGMENT_SPAN;
+
+    (0..segments).into_par_iter().for_each(|s| {
+        let lo = s * SEGMENT_SPAN;                 // even
+        let hi = (lo + SEGMENT_SPAN).min(bound);
+        // flags[i] <=> the odd number lo + 2i + 1 is composite
+        let n_flags = ((hi - lo) / 2) as usize;
+        let mut flags = vec![false; n_flags];
+        for &q in &small {
+            let q = q as u64;
+            if q * q >= hi { break; }
+            // first odd multiple of q that is >= max(q*q, lo)
+            let mut m = (q * q).max(((lo + q - 1) / q) * q);
+            if m % 2 == 0 { m += q; }
+            let mut i = ((m - lo) / 2) as usize;
+            while i < n_flags {
+                flags[i] = true;
+                i += q as usize;
+            }
+        }
+        for (i, &c) in flags.iter().enumerate() {
+            let p = lo + 2 * i as u64 + 1;
+            if !c && p >= 3 {
+                strike(seed, p as u32, composite);
+            }
+        }
+    });
+}
+
+/// Pick the sieve bound where one more `seed mod p` costs as much as the
+/// primality tests it is expected to save. Both costs are measured on this
+/// machine for this number size.
+fn choose_sieve_bound(seed: &Integer, ln_n: f64, test_secs: f64) -> u64 {
+    // Time `seed mod p` on a few thousand word-sized moduli.
+    let t = Instant::now();
+    let mut sink = 0u32;
+    let reps = 4000u32;
+    for i in 0..reps {
+        sink ^= seed.mod_u(0x7fff_0001u32.wrapping_add(2 * i));
+    }
+    std::hint::black_box(sink);
+    let mod_secs = (t.elapsed().as_secs_f64() / reps as f64).max(1e-10);
+
+    // tests(B) ≈ ln(N) * e^-γ / ln(B). Sieving prime p removes 1/p of them.
+    // Break-even: p = tests(B) * test_secs / mod_secs. Iterate to a fixed point.
+    let mut bound = 1e6f64;
+    for _ in 0..8 {
+        let tests = ln_n * 0.5615 / bound.ln();
+        bound = (tests * test_secs / mod_secs).clamp(1e3, u32::MAX as f64);
+    }
+    bound as u64
+}
+
+// ============================================================================
+// STAGE 3: FAST REJECT — one strong probable-prime test, base 2
 // ============================================================================
 
+/// A composite fails this with overwhelming probability, so it is the only
+/// modular exponentiation almost every candidate ever costs.
+fn strong_probable_prime_base2(n: &Integer) -> bool {
+    let mut n_minus_1 = n.clone();
+    n_minus_1 -= 1u32;
+    let r = n_minus_1.find_one(0).unwrap_or(0);
+    let d = n_minus_1.clone() >> r;
+    mr_witness_passes(&Integer::from(2u32), &d, r, n, &n_minus_1)
+}
+
+// ============================================================================
+// STAGE 4: CONFIRMATION — Miller-Rabin rounds + GMP Baillie-PSW
+// ============================================================================
 /// Single Miller-Rabin witness check — returns true if `a` does NOT witness compositeness.
 #[inline]
 fn mr_witness_passes(a: &Integer, d: &Integer, r: u32, n: &Integer, n_minus_1: &Integer) -> bool {
@@ -510,6 +493,17 @@ fn is_prime_miller_rabin(n: &Integer, rounds: u32) -> bool {
 
     // Check all witnesses in parallel — par_iter().all() short-circuits on false
     witnesses.par_iter().all(|a| mr_witness_passes(a, &d, r, n, &n_minus_1))
+}
+
+/// Full confirmation, run only on the rare candidate that passed base 2.
+fn confirm_prime(n: &Integer, rounds: u32) -> bool {
+    // Both checks run side by side across the thread pool.
+    // GMP: Baillie-PSW (strong base-2 + strong Lucas), then reps-24 extra MR rounds.
+    let (mr_ok, bpsw_ok) = rayon::join(
+        || is_prime_miller_rabin(n, rounds),
+        || n.is_probably_prime(25) != IsPrime::No,
+    );
+    mr_ok && bpsw_ok
 }
 
 // ============================================================================
@@ -624,12 +618,113 @@ fn load_training_data_with_history(conn: &Connection, target_digits: usize) -> V
 }
 
 // ============================================================================
+// ONE HUNT: seed -> sieve window -> test survivors in parallel
+// ============================================================================
+
+struct HuntStats {
+    sieve_bound: u64,
+    window: usize,
+    survivors: usize,
+    tests_run: u64,
+    sieve_time: std::time::Duration,
+    test_time: std::time::Duration,
+}
+
+fn hunt_once(config: &Config, pattern: &PatternMatrix) -> (Option<Integer>, HuntStats) {
+    // Symbolic seed, forced odd.
+    let seed_symbols = generate_symbolic_guided(config.sequence_len, pattern, config.pattern_guide_ratio);
+    let mut seed = collapse(&seed_symbols);
+    seed.set_bit(0, true);
+
+    let ln_n = seed.significant_bits() as f64 * std::f64::consts::LN_2;
+    let window = ((config.window_expected_primes * ln_n / 2.0).ceil() as usize).max(64);
+
+    // Time one real test on the seed itself (also a legitimate candidate).
+    let t = Instant::now();
+    let seed_passes = strong_probable_prime_base2(&seed);
+    let test_secs = t.elapsed().as_secs_f64();
+
+    let sieve_start = Instant::now();
+    let bound = choose_sieve_bound(&seed, ln_n, test_secs);
+    let composite: Vec<AtomicBool> = (0..window).map(|_| AtomicBool::new(false)).collect();
+    sieve_window(&seed, &composite, bound);
+    if !seed_passes {
+        composite[0].store(true, Ordering::Relaxed);
+    }
+    let sieve_time = sieve_start.elapsed();
+
+    let mut survivors: Vec<u32> = (0..window as u32)
+        .filter(|&k| !composite[k as usize].load(Ordering::Relaxed))
+        .collect();
+    // Random order: no bias toward primes that follow a long gap.
+    THREAD_RNG.with(|rng| survivors.shuffle(&mut *rng.borrow_mut()));
+
+    let pb = ProgressBar::new(survivors.len() as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] {pos}/{len} survivors tested | {per_sec} {msg}")
+            .unwrap()
+            .progress_chars("█▓▒░ "),
+    );
+
+    let tests_run = AtomicU64::new(0);
+    let test_start = Instant::now();
+    // The search stops the moment any candidate passes base 2, so every core is
+    // free for the confirmation rounds instead of testing more survivors.
+    let found = loop {
+        let hit = survivors.par_iter().find_map_any(|&k| {
+            let mut n = seed.clone();
+            n += 2 * k as u64;
+            let passed = strong_probable_prime_base2(&n);
+            tests_run.fetch_add(1, Ordering::Relaxed);
+            pb.inc(1);
+            if passed { Some((k, n)) } else { None }
+        });
+        match hit {
+            None => break None,
+            Some((_, n)) if confirm_prime(&n, config.primality_rounds) => break Some(n),
+            // A base-2 pseudoprime: astronomically rare. Drop it and keep going.
+            Some((k, _)) => survivors.retain(|&x| x != k),
+        }
+    };
+    pb.finish_and_clear();
+
+    let stats = HuntStats {
+        sieve_bound: bound,
+        window,
+        survivors: survivors.len(),
+        tests_run: tests_run.load(Ordering::Relaxed),
+        sieve_time,
+        test_time: test_start.elapsed(),
+    };
+    (found, stats)
+}
+
+impl HuntStats {
+    fn print(&self, ln_n: f64) {
+        let unsieved = ln_n / 2.0;
+        println!("\n{}", "📊 Pipeline Statistics:".bright_cyan().bold());
+        println!("   Sieve bound:                   {}", self.sieve_bound);
+        println!("   Window (odd offsets):          {}", self.window);
+        println!("   Survived sieve:                {} ({:.2}%)", self.survivors,
+                 self.survivors as f64 / self.window as f64 * 100.0);
+        println!("   Primality tests run:           {}", self.tests_run);
+        println!("   Expected with no sieve:        ~{:.0} tests per prime", unsieved);
+        println!("\n{}", "⏱️  Performance:".bright_cyan().bold());
+        println!("   Sieve time:                    {:.2?}", self.sieve_time);
+        println!("   Test time:                     {:.2?}", self.test_time);
+        println!("   Tests/sec:                     {:.2}",
+                 self.tests_run as f64 / self.test_time.as_secs_f64().max(0.001));
+    }
+}
+
+// ============================================================================
 // MAIN
 // ============================================================================
 
 fn main() {
     println!("\n{}", "🚀 QuanJP Prime Hunter 2050 - SYMBOLIC-FIRST EDITION".bright_green().bold());
-    println!("{}", "   ⚡ Tier 3: Symbolic exploration + numeric verification".bright_yellow());
+    println!("{}", "   ⚡ Symbolic seed + deep sieve + numeric verification".bright_yellow());
     println!("{}\n", "━".repeat(70).bright_blue());
 
     let physical_cpus = num_cpus::get_physical();
@@ -641,9 +736,13 @@ fn main() {
     println!("   Using threads:  {} (all cores)", physical_cpus.to_string().bright_green().bold());
 
     // =========================================================================
-    // 🎯 CHANGE THIS LINE TO TARGET DIFFERENT DIGIT SIZES
+    // 🎯 TARGET SIZE:  quanjp-prime-hunter [sequence_len] [how_many_primes]
+    //    digits ≈ sequence_len × 0.602.  Defaults below are used with no args.
     // =========================================================================
-    let config = Config::new(33200);  // Target: ~20,000 digits ← RECORD HUNT
+    let args: Vec<String> = std::env::args().collect();
+    let sequence_len: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(33200); // ~20,000 digits
+    let target_count: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
+    let config = Config::new(sequence_len);
     // =========================================================================
 
     // Only initialize DB for larger targets (8K+) to avoid overhead
@@ -673,25 +772,26 @@ fn main() {
     println!("\n{}", "⚙️  Configuration:".bright_cyan().bold());
     println!("   Sequence length:        {}", config.sequence_len);
     println!("   Target digits:          ~{}", config.target_digits().to_string().bright_white().bold());
-    println!("   Symbolic score gate:    > {:.2}", config.symbolic_score_threshold);
-    println!("   Miller-Rabin rounds:    {}", config.primality_rounds);
-    println!("   Max attempts:           {}", config.max_attempts);
+    println!("   Primes to find:         {}", target_count);
+    println!("   Miller-Rabin rounds:    {} (+ Baillie-PSW)", config.primality_rounds);
     println!("   Pattern guidance:       {:.0}%", config.pattern_guide_ratio * 100.0);
 
-    println!("\n{}", "🔧 Symbolic-First Pipeline:".bright_cyan().bold());
-    println!("   ① Symbolic generation");
-    println!("   ② Oddness gate (symbols[0] parity — eliminates ~50%)");
-    println!("   ③ Symbolic score gate (rejects ~60% of odd candidates)");
-    println!("   ④ Symbolic residue filters mod {{3,5,7,11,13,17,19,23}}");
-    println!("   ⑤ Partial collapse checks");
-    println!("   ⑥ Full GMP Integer collapse (now rare!)");
-    println!("   ⑦ Miller-Rabin (bases 2,3,5 + {} random witnesses)", config.primality_rounds.saturating_sub(3));
+    println!("\n{}", "🔧 Pipeline:".bright_cyan().bold());
+    println!("   ① Symbolic seed generation (pattern-guided, forced odd)");
+    println!("   ② Deep sieve over the window seed, seed+2, seed+4, ...");
+    println!("      (bound auto-tuned: cost of one more small prime vs tests it saves)");
+    println!("   ③ Strong probable-prime test base 2 on survivors, all cores");
+    println!("   ④ Confirmation: {} Miller-Rabin rounds + Baillie-PSW", config.primality_rounds);
 
-    println!("\n{}", "🚀 Starting Prime Hunt — TARGET: 1 RECORD PRIME (20,000 DIGITS)".bright_green().bold());
+    println!(
+        "\n{}",
+        format!("🚀 Starting Prime Hunt — TARGET: {} PRIME(S) OF ~{} DIGITS", target_count, config.target_digits())
+            .bright_green()
+            .bold()
+    );
 
-    let target_count = 1usize;
     let mut primes_found = 0usize;
-    let mut total_attempts: u64 = 0;
+    let mut total_tests: u64 = 0;
     let hunt_start = Instant::now();
 
     while primes_found < target_count {
@@ -702,52 +802,16 @@ fn main() {
                 .bold()
         );
 
-        let stats = Statistics::new();
-
-        let pb = ProgressBar::new(config.max_attempts);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] {pos}/{len} attempts | {per_sec} | ETA {eta} {msg}")
-                .unwrap()
-                .progress_chars("█▓▒░ "),
-        );
-
         let now = Instant::now();
+        let (result, stats) = hunt_once(&config, &pattern_matrix);
+        let round_duration = now.elapsed();
+        total_tests += stats.tests_run;
 
-        // Snapshot pattern matrix for this parallel round
-        let pm_snap = pattern_matrix.clone();
+        match result {
+            Some(prime) => {
+                primes_found += 1;
 
-        let result = (0..config.max_attempts).into_par_iter().find_map_any(|_| {
-            let attempt = stats.attempts.fetch_add(1, Ordering::Relaxed);
-
-            if attempt % 100 == 0 {
-                pb.set_position(attempt);
-                let secs = now.elapsed().as_secs_f64();
-                if secs > 0.0 {
-                    pb.set_message(format!("({:.0} att/s)", attempt as f64 / secs));
-                }
-            }
-
-            let symbols = generate_symbolic_guided(config.sequence_len, &pm_snap, config.pattern_guide_ratio);
-
-            if !is_symbolically_odd(&symbols) { return None; }
-
-            let score = symbolic_score(&symbols, &pm_snap);
-            if score < config.symbolic_score_threshold { return None; }
-            stats.symbolic_score_passed.fetch_add(1, Ordering::Relaxed);
-
-            let residues = symbolic_residues(&symbols);
-            if residues.iter().any(|&r| r == 0) { return None; }
-            stats.symbolic_residue_passed.fetch_add(1, Ordering::Relaxed);
-
-            if !partial_collapse_check(&symbols) { return None; }
-            stats.partial_collapse_passed.fetch_add(1, Ordering::Relaxed);
-
-            let n = collapse_fast(&symbols);
-            stats.full_collapse_passed.fetch_add(1, Ordering::Relaxed);
-
-            if is_prime_miller_rabin(&n, config.primality_rounds) {
-                stats.miller_rabin_passed.fetch_add(1, Ordering::Relaxed);
+                let symbols = symbols_of(&prime, config.sequence_len);
                 let ent = {
                     let mut counts = [0usize; 4];
                     for &s in &symbols { counts[(s + 1) as usize] += 1; }
@@ -756,19 +820,6 @@ fn main() {
                         .map(|&c| { let p = c as f64 / total; -p * p.log2() })
                         .sum::<f64>()
                 };
-                Some((n, ent, symbols))
-            } else {
-                None
-            }
-        });
-
-        pb.finish_and_clear();
-        let round_duration = now.elapsed();
-        total_attempts += stats.attempts.load(Ordering::Relaxed);
-
-        match result {
-            Some((prime, ent, symbols)) => {
-                primes_found += 1;
 
                 let prime_str = prime.to_string_radix(10);
                 let digits = prime_str.len();
@@ -782,6 +833,7 @@ fn main() {
                 println!("\n   Digits:      {}", digits.to_string().bright_white().bold());
                 println!("   Entropy:     {:.6}", ent);
                 println!("   Sequence:    {}", symbols.len());
+                println!("   Hunt time:   {:.2?}", round_duration);
 
                 let session_id = format!(
                     "QuanJP-Symbolic-{}-{}-#{:02}",
@@ -803,7 +855,8 @@ fn main() {
                     }
                 }
 
-                stats.print_summary(round_duration);
+                let ln_n = prime.significant_bits() as f64 * std::f64::consts::LN_2;
+                stats.print(ln_n);
 
                 let filename = format!("quanjp_prime_{:02}_{digits}digits.txt", primes_found);
                 std::fs::write(&filename, format!(
@@ -828,17 +881,17 @@ fn main() {
             }
             None => {
                 println!(
-                    "   ⚠️  Round exhausted ({} attempts) — retrying...",
-                    stats.attempts.load(Ordering::Relaxed)
+                    "   ⚠️  Window exhausted ({} tests, no prime) — new seed...",
+                    stats.tests_run
                 );
             }
         }
     }
 
     let total_elapsed = hunt_start.elapsed();
-    println!("\n{}", "🏆 ALL 10 PRIMES FOUND!".bright_green().bold());
+    println!("\n{}", format!("🏆 ALL {} PRIME(S) FOUND!", target_count).bright_green().bold());
     println!("   Total wall time : {:.2?}", total_elapsed);
-    println!("   Total attempts  : {}", total_attempts);
+    println!("   Total tests     : {}", total_tests);
     println!(
         "   Avg per prime   : {:.2?}",
         total_elapsed / target_count as u32
